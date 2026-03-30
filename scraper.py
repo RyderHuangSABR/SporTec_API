@@ -5,24 +5,24 @@ import pandas as pd
 from datetime import datetime, timedelta
 from huggingface_hub import HfApi, login
 
-print("🕵️‍♂️ Booting the Mozilla-Bypass Scraper...")
+print("🕵️‍♂️ Booting the Atlas Automated Scraper...")
 
 # ==========================================
-# 1. AUTHENTICATE
+# 1. AUTHENTICATE THE VAULT
 # ==========================================
 HF_TOKEN = os.getenv("HF_TOKEN")
 if not HF_TOKEN:
-    raise ValueError("❌ HF_TOKEN missing! Check GitHub Secrets.")
+    raise ValueError("❌ HF_TOKEN missing! The GitHub Action did not pass the secret.")
 login(token=HF_TOKEN)
 
 DATA_REPO = "RyderHuangSABR/Atlas_Pitching_Data"
 
 # ==========================================
-# 2. THE MOZILLA ENGINE
+# 2. THE MOZILLA-BYPASS ENGINE
 # ==========================================
 def scrape_savant_csv(start_date, end_date, is_milb=False):
     """
-    Directly hits the Baseball Savant backend by mimicking a Mozilla browser.
+    Hits the Baseball Savant backend by mimicking a real human browser.
     """
     level = "MiLB" if is_milb else "MLB"
     print(f"📡 Requesting {level} Data for {start_date}...")
@@ -30,7 +30,7 @@ def scrape_savant_csv(start_date, end_date, is_milb=False):
     # The exact backend URL Baseball Savant uses to generate CSVs
     url = "https://baseballsavant.mlb.com/statcast_search/csv"
     
-    # We pass the exact parameters the website uses, flipping 'minors=true' for MiLB
+    # Passing the exact URL parameters, flipping 'minors=true' for MiLB
     params = {
         "all": "true", "hfGT": "R|", "player_type": "pitcher",
         "game_date_gt": start_date, "game_date_lt": end_date,
@@ -38,7 +38,7 @@ def scrape_savant_csv(start_date, end_date, is_milb=False):
         "type": "details"
     }
     
-    # 🚨 THE BYPASS: We tell the server we are a real human on a Mozilla browser
+    # 🚨 THE BYPASS: Tricking the server into thinking we are Google Chrome
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/csv"
@@ -47,7 +47,7 @@ def scrape_savant_csv(start_date, end_date, is_milb=False):
     try:
         response = requests.get(url, params=params, headers=headers, timeout=60)
         
-        # If Savant catches us or throws an error, we catch it
+        # If Savant catches us or throws an error, we catch it gracefully
         if response.status_code != 200:
             print(f"⚠️ Warning: Savant returned status {response.status_code} for {level}.")
             return pd.DataFrame()
@@ -67,38 +67,40 @@ def scrape_savant_csv(start_date, end_date, is_milb=False):
         return pd.DataFrame()
 
 # ==========================================
-# 3. EXECUTE THE HEIST
+# 3. EXECUTE THE DAILY HEIST
 # ==========================================
-# Look at yesterday's date
+# Calculate exactly "yesterday" based on UTC time
 yesterday = (datetime.now() - timedelta(1)).strftime('%Y-%m-%d')
 
-# 1. Grab Major Leagues
+# Pull both leagues
 mlb_df = scrape_savant_csv(yesterday, yesterday, is_milb=False)
-
-# 2. Grab Minor Leagues
 milb_df = scrape_savant_csv(yesterday, yesterday, is_milb=True)
 
-# Combine them into one massive dataset
+# Combine them into one master dataset
 combined_df = pd.concat([mlb_df, milb_df], ignore_index=True)
 
 if combined_df.empty:
-    print("🌙 No games yesterday (Off-season or rainouts). Going back to sleep.")
+    print("🌙 No games yesterday. Engine returning to standby mode.")
     exit(0)
 
 print(f"✅ Successfully extracted {len(combined_df)} total pitches (MLB + MiLB).")
 
 # ==========================================
-# 4. UPLOAD TO THE VAULT
+# 4. COMPRESS AND UPLOAD
 # ==========================================
-file_name = "Yesterday_Pitches.parquet"
+# Dynamic naming to build an archive, not an overwrite
+file_name = f"Pitches_{yesterday}.parquet"
 combined_df.to_parquet(file_name, engine='pyarrow')
+
+print(f"📦 Compressing into Parquet format: {file_name}")
 
 api = HfApi()
 api.upload_file(
     path_or_fileobj=file_name,
-    path_in_repo=f"Atlas/{file_name}",
+    # This creates a clean 'daily_pulls' folder in your Hugging Face repo
+    path_in_repo=f"daily_pulls/{file_name}", 
     repo_id=DATA_REPO,
     repo_type="dataset"
 )
 
-print("🚀 Payload delivered to Hugging Face Vault. The Engine is ready to process.")
+print("🚀 Payload delivered to Hugging Face Vault. The pipeline is complete.")
