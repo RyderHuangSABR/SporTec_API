@@ -1,109 +1,61 @@
 import os
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 import pandas as pd
-import numpy as np
 
-from engine.loader import load_all_models, get_models_for_pitch
-from engine.scoring import score_pitch
-from engine.features import FEATURES
+# Import your engine functions
+from engine.loader import load_all_models
 from engine.recommender import recommend_arsenal
 
-app = FastAPI(title="Atlas Engine API", version="3.0")
+# 1. Initialize the API
+app = FastAPI(title="Atlas Pitching Engine", version="1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 2. Setup the Bouncer (API Key Security)
+api_key_header = APIKeyHeader(name="X-API-Key")
 
-@app.on_event("startup")
-async def startup_event():
-    print("🚀 Booting Atlas Cloud Server...")
-    load_all_models()
-    print("✅ Models loaded. System Ready.")
+def get_api_key(api_key: str = Security(api_key_header)):
+    # Grab the secret password from Render's secure vault
+    expected_key = os.getenv("ATLAS_SECRET_KEY")
+    
+    if not expected_key:
+        raise HTTPException(status_code=500, detail="Server Error: Missing Secret Key.")
+    if api_key != expected_key:
+        raise HTTPException(status_code=401, detail="Unauthorized: Get off my server.")
+    return api_key
 
-class PitchSimulationRequest(BaseModel):
-    pitch_type: str
+# 3. Define the exact JSON structure your iPad will send
+class TargetPitch(BaseModel):
+    vaa: float
+    haa: float
+    release_extension: float
+    spin_axis: float
     release_speed: float
     pfx_x: float
     pfx_z: float
-    release_extension: float
-    release_pos_x: float
-    release_pos_z: float
-    spin_axis: float
-    release_spin_rate: float
-    vy0: float
-    ay: float
-    vz0: float
-    az: float
-    vx0: float
-    ax: float
 
-@app.post("/api/v1/simulate")
-async def simulate_custom_pitch(req: PitchSimulationRequest):
-    try:
-        df = pd.DataFrame([req.dict()])
-        
-        # Hawk-Eye Physics
-        radicand = df['vy0']**2 - 2 * df['ay'] * (50 - 17/12)
-        radicand = np.clip(radicand, a_min=0, a_max=None) 
-        t = (-df['vy0'] - np.sqrt(radicand)) / df['ay']
-        
-        vy_f = df['vy0'] + df['ay'] * t
-        vz_f = df['vz0'] + df['az'] * t
-        vx_f = df['vx0'] + df['ax'] * t
-        
-        df['vaa'] = np.rad2deg(np.arctan(vz_f / vy_f))
-        df['haa'] = np.rad2deg(np.arctan(vx_f / vy_f))
-        df['reaction_time'] = (50 - df['release_extension']) / abs(df['vy0'])
-        
-        t_commit = 0.167 
-        df['commit_x'] = df['release_pos_x'] + (df['vx0'] * t_commit) + (0.5 * df['ax'] * (t_commit**2))
-        df['commit_z'] = df['release_pos_z'] + (df['vz0'] * t_commit) + (0.5 * df['az'] * (t_commit**2))
-        df['movement_ratio'] = abs(df['pfx_x']) / (abs(df['pfx_z']) + 0.1)
+# 4. Pre-load the models when the server boots up
+@app.on_event("startup")
+async def startup_event():
+    print("🚀 Booting up Atlas Engine...")
+    load_all_models()
+    print("✅ XGBoost Models loaded.")
 
-        # AI Inference
-        df['pitch_type'] = df['pitch_type'].astype('category')
-        models = get_models_for_pitch(req.pitch_type)
-        if not models: raise ValueError(f"No ML model for {req.pitch_type}")
-            
-        q_plus, c_plus = score_pitch(df, models, FEATURES)
+# 5. The Main VIP Endpoint
+@app.post("/predict")
+async def predict(pitch: TargetPitch, key: str = Security(get_api_key)):
+    # Convert the iPad's JSON into a single-row Pandas DataFrame
+    target_df = pd.DataFrame([pitch.dict()])
+    
+    # Run your memory-optimized recommendation engine
+    result = recommend_arsenal(target_df)
+    
+    return {
+        "status": "success",
+        "prediction": result
+    }
 
-        return {
-            "status": 200,
-            "data": {
-                "quality_plus": round(q_plus, 1),
-                "command_plus": round(c_plus, 1),
-                "kinematics": {
-                    "vaa": round(float(df['vaa'].iloc[0]), 2),
-                    "haa": round(float(df['haa'].iloc[0]), 2)
-                }
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/recommend")
-async def get_pitch_recommendation(req: PitchSimulationRequest):
-    try:
-        target_df = pd.DataFrame([req.dict()])
-        
-        # Calculate VAA/HAA for the KNN
-        radicand = target_df['vy0']**2 - 2 * target_df['ay'] * (50 - 17/12)
-        radicand = np.clip(radicand, a_min=0, a_max=None) 
-        t = (-target_df['vy0'] - np.sqrt(radicand)) / target_df['ay']
-        vz_f = target_df['vz0'] + target_df['az'] * t
-        vy_f = target_df['vy0'] + target_df['ay'] * t
-        vx_f = target_df['vx0'] + target_df['ax'] * t
-        
-        target_df['vaa'] = np.rad2deg(np.arctan(vz_f / vy_f))
-        target_df['haa'] = np.rad2deg(np.arctan(vx_f / vy_f))
-        
-        recommendation = recommend_arsenal(target_df)
-        return {"status": 200, "data": recommendation}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# 6. A public health-check (No password required, just to prove it's awake)
+@app.get("/")
+async def health_check():
+    return {"message": "Atlas API is Live. The bouncer is at the door."}
