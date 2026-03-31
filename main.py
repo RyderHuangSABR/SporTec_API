@@ -54,8 +54,9 @@ def get_client_identity(api_key: str = Security(api_key_header)):
     
     return client_name
 
-# 4. Data Models (What clients send you)
+# 4. Data Models (What clients MUST send you)
 class TargetPitch(BaseModel):
+    p_throws: str  # 'R' or 'L' - Enforces handedness quarantine
     vaa: float
     haa: float
     release_extension: float
