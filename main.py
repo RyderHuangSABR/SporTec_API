@@ -1,19 +1,34 @@
 import os
 import secrets
-from fastapi import FastAPI, HTTPException, Security
+from fastapi import FastAPI, HTTPException, Security, Request
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 from supabase import create_client, Client
 
-# Your proprietary mathematical engine (Safe in the kitchen)
+# --- THE BLAST SHIELD IMPORTS ---
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Your proprietary mathematical engine
 from engine.recommender import recommend_arsenal
 
-# 1. Initialize the API
+# 1. Initialize the Rate Limiter (Tracks by API Key, falls back to IP)
+def get_api_key_from_request(request: Request):
+    return request.headers.get("X-API-Key", get_remote_address(request))
+
+limiter = Limiter(key_func=get_api_key_from_request)
+
+# 2. Initialize the API
 app = FastAPI(title="Atlas Pitching Engine", version="4.0-Data-Broker")
 
-# 2. CORS Middleware
+# Tell FastAPI what to do when someone breaks the speed limit
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# 3. CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -22,12 +37,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3. SUPABASE SETUP (The Cloud VIP List)
-# Add these to your Render Environment Variables!
+# 4. SUPABASE SETUP (The Cloud VIP List)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Only initialize Supabase if the keys are present (prevents local crashing)
 if SUPABASE_URL and SUPABASE_KEY:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 else:
@@ -41,45 +54,40 @@ def get_client_identity(api_key: str = Security(api_key_header)):
     if not supabase:
         raise HTTPException(status_code=500, detail="Database connection severed.")
         
-    # Query Supabase for the exact key
     response = supabase.table("api_clients").select("*").eq("api_key", api_key).execute()
     
     if len(response.data) == 0:
-        print(f"🚨 BOUNCER ALERT: Rejected invalid key attempt: {api_key[:8]}...")
+        print(f"🚨 BOUNCER ALERT: Rejected invalid key attempt.")
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid API Key.")
     
-    # Grab the client's name from the database response
     client_name = response.data[0]["client_name"]
-    print(f"🔑 ACCESS GRANTED: {client_name} has entered the server.")
-    
     return client_name
 
-# 4. Data Models (What clients MUST send you)
+# 5. Data Models
 class TargetPitch(BaseModel):
-    p_throws: str  # 'R' or 'L' - Enforces handedness quarantine
+    p_throws: str  
     vaa: float
     haa: float
     release_extension: float
-    spin_axis: float
+    release_pos_z: float    
+    release_pos_x: float    
+    fastball_speed: float   
     release_speed: float
-    pfx_x: float
-    pfx_z: float
+    spin_axis: float
 
 class MintRequest(BaseModel):
     client_name: str
     tier: str
     admin_password: str
 
-# 5. THE MAIN VIP ENDPOINT (The Kitchen)
+# 6. THE MAIN VIP ENDPOINT (Now with Rate Limiting!)
 @app.post("/predict")
-async def predict(pitch: TargetPitch, client_name: str = Security(get_client_identity)):
+@limiter.limit("10/minute") # <--- THE SHIELD. CHANGE THIS STRING TO EXPAND LIMITS.
+async def predict(request: Request, pitch: TargetPitch, client_name: str = Security(get_client_identity)):
     
-    print(f"⚙️ Running DuckDB Euclidean Math for: {client_name}")
+    print(f"⚙️ {client_name} requested a DuckDB scan. Limit: OK.")
     
-    # Convert their JSON into a DataFrame
-    target_df = pd.DataFrame([pitch.dict()])
-    
-    # Run your memory-optimized recommendation engine
+    target_df = pd.DataFrame([pitch.model_dump()])
     result = recommend_arsenal(target_df)
     
     return {
@@ -88,21 +96,16 @@ async def predict(pitch: TargetPitch, client_name: str = Security(get_client_ide
         "prediction": result
     }
 
-# 6. GOD MODE (The Minting Press)
+# 7. GOD MODE (The Minting Press)
 @app.post("/admin/mint_key")
 async def mint_api_key(req: MintRequest):
-    """Generates a new API key and saves it to Supabase instantly."""
     
-    # Check your Master Password (Set in Render Env Vars)
-    expected_password = os.getenv("ATLAS_MASTER_KEY", "ryder_admin_override_99")
-    if req.admin_password != expected_password:
-        print("🚨 ALERT: Unauthorized access to God Mode.")
+    expected_password = os.getenv("ATLAS_MASTER_KEY")
+    if not expected_password or req.admin_password != expected_password:
         raise HTTPException(status_code=403, detail="Nice try. Access Denied.")
     
-    # Forge the new cryptographic key
     new_api_key = f"atl_{secrets.token_hex(16)}"
     
-    # Inject it directly into your free Supabase database
     try:
         new_client_data = {
             "api_key": new_api_key,
@@ -123,7 +126,8 @@ async def mint_api_key(req: MintRequest):
         print(f"Supabase Error: {e}")
         raise HTTPException(status_code=500, detail="Database fault during minting.")
 
-# 7. Health Check
+# 8. Health Check
 @app.get("/")
-async def health_check():
+@limiter.limit("5/minute") # Stops people from spam-pinging the home page
+async def health_check(request: Request):
     return {"message": "Atlas API is Live. The bouncer is checking IDs."}
