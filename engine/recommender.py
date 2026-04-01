@@ -14,13 +14,12 @@ def get_db_connection():
         HF_TOKEN = os.getenv("HF_TOKEN")
         DATA_REPO = "RyderHuangSABR/Atlas_Pitching_Data"
         
-        # 2. Point to the ACTUAL Atlas feature dataset, not the leaderboard
-        # Update this filename to match exactly what is inside your HF repo
+        # 2. Point to the ACTUAL Atlas feature dataset
         TARGET_FILE = "Atlas/cleaned_pitch_data.parquet" 
         
         print(f"⚙️ Fetching {TARGET_FILE} from HuggingFace Vault...")
         try:
-            # Pull the historical data into the Render container's temporary storage
+            # Pull the historical data into the container's temporary storage
             file_path = hf_hub_download(
                 repo_id=DATA_REPO, 
                 filename=TARGET_FILE, 
@@ -31,10 +30,11 @@ def get_db_connection():
             # Initialize DuckDB in-memory for zero-latency queries
             _DB_CONNECTION = duckdb.connect(database=':memory:')
             
+            # BULLETPROOFING: Added OR REPLACE to prevent hot-reload crashes
             if TARGET_FILE.endswith('.parquet'):
-                _DB_CONNECTION.execute(f"CREATE VIEW mlb_history AS SELECT * FROM read_parquet('{file_path}')")
+                _DB_CONNECTION.execute(f"CREATE OR REPLACE VIEW mlb_history AS SELECT * FROM read_parquet('{file_path}')")
             else:
-                _DB_CONNECTION.execute(f"CREATE VIEW mlb_history AS SELECT * FROM read_csv_auto('{file_path}')")
+                _DB_CONNECTION.execute(f"CREATE OR REPLACE VIEW mlb_history AS SELECT * FROM read_csv_auto('{file_path}')")
                 
             print("💎 Atlas Engine Armed and Ready.")
         except Exception as e:
@@ -67,8 +67,7 @@ def recommend_arsenal(target_df):
         t_hand = str(target_df['p_throws'].iloc[0]).upper()
 
         # 2. THE HOLY GRAIL: Weighted Euclidean Kinematic Distance
-        # Weights: Angles (x10), Release Point (x8), Extension (x5), Velo Delta (x3)
-        # Circular Spin Axis Math calculates the shortest distance around a 360-degree wheel.
+        # BULLETPROOFING: Wrapped all injected variables in parentheses to prevent double-negative SQL errors.
         query = f"""
             SELECT 
                 MLBID, 
@@ -79,13 +78,13 @@ def recommend_arsenal(target_df):
                 pfx_x,
                 pfx_z,
                 SQRT(
-                    POWER((vaa - {t_vaa}) * 10.0, 2) + 
-                    POWER((haa - {t_haa}) * 10.0, 2) + 
-                    POWER((release_extension - {t_ext}) * 5.0, 2) + 
-                    POWER((release_pos_z - {t_z}) * 8.0, 2) + 
-                    POWER((release_pos_x - {t_x}) * 8.0, 2) + 
-                    POWER(((fb_speed - release_speed) - {t_velo_delta}) * 3.0, 2) +
-                    POWER(LEAST(ABS(spin_axis - {t_axis}), 360 - ABS(spin_axis - {t_axis})) * 0.1, 2)
+                    POWER((vaa - ({t_vaa})) * 10.0, 2) + 
+                    POWER((haa - ({t_haa})) * 10.0, 2) + 
+                    POWER((release_extension - ({t_ext})) * 5.0, 2) + 
+                    POWER((release_pos_z - ({t_z})) * 8.0, 2) + 
+                    POWER((release_pos_x - ({t_x})) * 8.0, 2) + 
+                    POWER(((fb_speed - release_speed) - ({t_velo_delta})) * 3.0, 2) +
+                    POWER(LEAST(ABS(spin_axis - ({t_axis})), 360 - ABS(spin_axis - ({t_axis}))) * 0.1, 2)
                 ) as kinematic_distance
             FROM mlb_history
             WHERE pitch_type NOT IN ('FF', 'SI', 'FC') -- Filter out fastballs to isolate secondaries
@@ -104,21 +103,16 @@ def recommend_arsenal(target_df):
             }
 
         # 3. Hedge-Fund Logic: The Stability Filter
-        # Calculate Mean and Standard Deviation of Quality+ for each pitch type in the cluster
         stats = clones.groupby('pitch_type')['Quality_Plus'].agg(['mean', 'std']).fillna(0)
         
         # Calculate pseudo-Sharpe ratio: (Mean / (StdDev + 1))
-        # Punishes volatile pitch types that frequently hang or miss the zone.
         stats['stability_score'] = stats['mean'] / (stats['std'] + 1)
         
         # Identify the most stable, high-ceiling pitch type for this specific chassis
         best_pitch_type = stats['stability_score'].idxmax()
         
         # 4. The "No Frankenstein" Logic
-        # Isolate ONLY that top pitch type from our nearest neighbors
         optimal_cluster = clones[clones['pitch_type'] == best_pitch_type]
-        
-        # Grab the literal #1 best historical iteration of that pitch from the cluster
         best_clone = optimal_cluster.sort_values(by='Quality_Plus', ascending=False).iloc[0]
 
         top_pitch = str(best_clone['pitch_type'])
