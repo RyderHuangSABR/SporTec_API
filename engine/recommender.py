@@ -10,22 +10,32 @@ def get_db_connection():
     """Bootstraps the DuckDB in-memory vault on first load."""
     global _DB_CONNECTION
     if _DB_CONNECTION is None:
+        # 1. Grab the secure token from Render's environment variables
         HF_TOKEN = os.getenv("HF_TOKEN")
         DATA_REPO = "RyderHuangSABR/Atlas_Pitching_Data"
         
-        print("⚙️ Fetching 10-Year Backtest from HuggingFace Vault...")
+        # 2. Point to the ACTUAL Atlas feature dataset, not the leaderboard
+        # Update this filename to match exactly what is inside your HF repo
+        TARGET_FILE = "Atlas/cleaned_pitch_data.parquet" 
+        
+        print(f"⚙️ Fetching {TARGET_FILE} from HuggingFace Vault...")
         try:
-            # Pull the historical Parquet/CSV from the vault
+            # Pull the historical data into the Render container's temporary storage
             file_path = hf_hub_download(
                 repo_id=DATA_REPO, 
-                filename="reports/SABR_10_Year_Backtest_Leaderboard.csv", 
+                filename=TARGET_FILE, 
                 repo_type="dataset", 
                 token=HF_TOKEN
             )
             
             # Initialize DuckDB in-memory for zero-latency queries
             _DB_CONNECTION = duckdb.connect(database=':memory:')
-            _DB_CONNECTION.execute(f"CREATE VIEW mlb_history AS SELECT * FROM read_csv_auto('{file_path}')")
+            
+            if TARGET_FILE.endswith('.parquet'):
+                _DB_CONNECTION.execute(f"CREATE VIEW mlb_history AS SELECT * FROM read_parquet('{file_path}')")
+            else:
+                _DB_CONNECTION.execute(f"CREATE VIEW mlb_history AS SELECT * FROM read_csv_auto('{file_path}')")
+                
             print("💎 Atlas Engine Armed and Ready.")
         except Exception as e:
             print(f"⚠️ Failed to bootstrap vault: {e}")
