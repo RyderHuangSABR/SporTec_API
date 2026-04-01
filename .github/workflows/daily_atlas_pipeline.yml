@@ -1,43 +1,30 @@
 name: Daily Savant Pipeline
 
-# 1. THE TRIGGER
 on:
   schedule:
-    # Runs at 10:00 AM UTC every day (6:00 AM Eastern Time)
-    # This guarantees MLB has finished processing all of yesterday's games.
     - cron: '0 10 * * *'
-  
-  # This line creates a "Run Workflow" button in GitHub so you can test it manually!
   workflow_dispatch: 
 
-# 2. THE HEIST
 jobs:
   extract_and_load:
     runs-on: ubuntu-latest
 
     steps:
-      # Step A: Download your repository code into the virtual machine
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Step B: Install Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # Step C: Install your specific weapons
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests pyarrow huggingface_hub
 
-      # Step D: Execute the script and unlock the vault
       - name: Run Mozilla-Bypass Scraper
         env:
-          # THIS IS THE MOST IMPORTANT LINE. 
-          # It passes your GitHub Secret into the Python script.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python scraper.py 
-          # (Make sure this matches the actual name of your python file!)
+          python scraper.py
