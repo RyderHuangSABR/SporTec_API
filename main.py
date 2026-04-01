@@ -1,86 +1,106 @@
-import os, secrets, pandas as pd
-from fastapi import FastAPI, HTTPException, Security, Request
+import os
+import secrets
+from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import pandas as pd
 from supabase import create_client, Client
+
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from engine.recommender import recommend_arsenal
 
-# 1. SETUP
-def get_api_key(request: Request):
+def get_api_key_from_request(request: Request):
     return request.headers.get("X-API-Key", get_remote_address(request))
 
-limiter = Limiter(key_func=get_api_key)
-app = FastAPI(title="Atlas Hexcore API")
+limiter = Limiter(key_func=get_api_key_from_request)
+
+app = FastAPI(title="Atlas Pitching Engine", version="4.0-Data-Broker")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# 2. MODELS
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
+    print("⚠️ WARNING: Supabase keys missing.")
+
+api_key_header = APIKeyHeader(name="X-API-Key")
+
+def get_client_identity(api_key: str = Security(api_key_header)):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection severed.")
+        
+    response = supabase.table("api_clients").select("*").eq("api_key", api_key).execute()
+    
+    if len(response.data) == 0:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid API Key.")
+    
+    return response.data[0]["client_name"]
+
 class TargetPitch(BaseModel):
-    p_throws: str; vaa: float; haa: float; release_extension: float; 
-    release_pos_z: float; release_pos_x: float; fastball_speed: float; 
-    release_speed: float; spin_axis: float
+    p_throws: str  
+    vaa: float
+    haa: float
+    release_extension: float
+    release_pos_z: float    
+    release_pos_x: float    
+    fastball_speed: float   
+    release_speed: float
+    spin_axis: float
 
-# 3. THE BOUNCER (Now smarter)
-async def verify_and_log(api_key: str, input_data: dict, output_data: dict):
-    """The Hexcore learns: Log every request for future training."""
-    try:
-        # 1. Verify and get client info
-        res = supabase.table("api_clients").select("*").eq("api_key", api_key).execute()
-        if not res.data:
-            raise HTTPException(status_code=401, detail="Invalid Key")
-        
-        client = res.data[0]
-        
-        # 2. Log telemetry (This is how your data 'evolves')
-        log_entry = {
-            "client_id": client['id'],
-            "input_json": input_data,
-            "prediction": output_data.get("recommended_pitch"),
-            "q_plus": output_data.get("expected_quality_plus")
-        }
-        supabase.table("request_logs").insert(log_entry).execute()
-        
-        return client
-    except:
-        raise HTTPException(status_code=401, detail="Access Denied")
+class MintRequest(BaseModel):
+    client_name: str
+    tier: str
+    admin_password: str
 
-# --- ADD THIS INSIDE YOUR main.py ---
-
-async def log_prediction(client_name: str, input_data: dict, output_data: dict):
-    """Saves every calculation to the 'Hexcore Memory' in Supabase."""
+# --- THE TELEMETRY HARVESTER ---
+def log_hexcore_telemetry(client_name: str, pitch_data: dict, recommendation: dict):
+    """Silently harvests the API request data into Supabase to expand the 1-NN memory."""
     if supabase:
         try:
-            log_entry = {
+            telemetry_payload = {
                 "client_name": client_name,
-                "input_vaa": input_data.get("vaa"),
-                "input_speed": input_data.get("release_speed"),
-                "rec_pitch": output_data.get("recommended_pitch"),
-                "rec_q_plus": output_data.get("expected_quality_plus")
+                "input_vaa": pitch_data["vaa"],
+                "input_speed": pitch_data["release_speed"],
+                "input_p_throws": pitch_data["p_throws"],
+                "recommended_pitch": recommendation.get("recommended_pitch", "Error"),
+                "kinematic_distance": recommendation.get("kinematic_distance", 999.9),
+                "apex_clone_mlbid": recommendation.get("apex_clone_mlbid", 0)
             }
-            supabase.table("prediction_logs").insert(log_entry).execute()
+            supabase.table("telemetry_logs").insert(telemetry_payload).execute()
         except Exception as e:
-            print(f"Log Error: {e}")
+            print(f"Silent Telemetry Error: {e}")
 
-# --- UPDATE YOUR PREDICT ENDPOINT ---
 @app.post("/predict")
-@limiter.limit("10/minute")
-async def predict(request: Request, pitch: TargetPitch, client_name: str = Security(get_client_identity)):
+@limiter.limit("10/minute") 
+async def predict(
+    request: Request, 
+    pitch: TargetPitch, 
+    background_tasks: BackgroundTasks, 
+    client_name: str = Security(get_client_identity)
+):
+    print(f"⚙️ {client_name} requested a 1-NN DuckDB scan. Limit: OK.")
     
     target_df = pd.DataFrame([pitch.model_dump()])
     result = recommend_arsenal(target_df)
     
-    # NEW: Async logging - The system now remembers what it did
-    import asyncio
-    asyncio.create_task(log_prediction(client_name, pitch.model_dump(), result))
+    # Send the data to Supabase in the background
+    background_tasks.add_task(log_hexcore_telemetry, client_name, pitch.model_dump(), result)
     
     return {
         "status": "success",
@@ -88,26 +108,32 @@ async def predict(request: Request, pitch: TargetPitch, client_name: str = Secur
         "prediction": result
     }
 
-    # Run Math
-    input_dict = pitch.model_dump()
-    result = recommend_arsenal(pd.DataFrame([input_dict]))
-    
-    # Verify & Log Telemetry
-    await verify_and_log(api_key, input_dict, result)
-    
-    return result
-
 @app.post("/admin/mint_key")
-async def mint_key(client_name: str, tier: str, admin_password: str):
-    if admin_password != os.getenv("ATLAS_MASTER_KEY"):
-        raise HTTPException(status_code=403)
+async def mint_api_key(req: MintRequest):
+    expected_password = os.getenv("ATLAS_MASTER_KEY")
+    if not expected_password or req.admin_password != expected_password:
+        raise HTTPException(status_code=403, detail="Nice try. Access Denied.")
     
-    new_key = f"atl_{secrets.token_hex(16)}"
-    supabase.table("api_clients").insert({
-        "api_key": new_key, "client_name": client_name, "tier": tier
-    }).execute()
+    new_api_key = f"atl_{secrets.token_hex(16)}"
     
-    return {"key": new_key}
+    try:
+        new_client_data = {
+            "api_key": new_api_key,
+            "client_name": req.client_name,
+            "tier": req.tier
+        }
+        supabase.table("api_clients").insert(new_client_data).execute()
+        
+        return {
+            "status": "success",
+            "message": "Key injected into Supabase vault.",
+            "client_name": req.client_name,
+            "api_key": new_api_key
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Database fault during minting.")
 
 @app.get("/")
-async def health(): return {"status": "Glorious Evolution in progress."}
+@limiter.limit("5/minute")
+async def health_check(request: Request):
+    return {"message": "Atlas 1-NN Engine is Live."}
