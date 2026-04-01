@@ -53,12 +53,40 @@ async def verify_and_log(api_key: str, input_data: dict, output_data: dict):
     except:
         raise HTTPException(status_code=401, detail="Access Denied")
 
-# 4. ENDPOINTS
+# --- ADD THIS INSIDE YOUR main.py ---
+
+async def log_prediction(client_name: str, input_data: dict, output_data: dict):
+    """Saves every calculation to the 'Hexcore Memory' in Supabase."""
+    if supabase:
+        try:
+            log_entry = {
+                "client_name": client_name,
+                "input_vaa": input_data.get("vaa"),
+                "input_speed": input_data.get("release_speed"),
+                "rec_pitch": output_data.get("recommended_pitch"),
+                "rec_q_plus": output_data.get("expected_quality_plus")
+            }
+            supabase.table("prediction_logs").insert(log_entry).execute()
+        except Exception as e:
+            print(f"Log Error: {e}")
+
+# --- UPDATE YOUR PREDICT ENDPOINT ---
 @app.post("/predict")
-@limiter.limit("20/minute") # Increased for the 'Glorious Evolution'
-async def predict(request: Request, pitch: TargetPitch):
-    api_key = request.headers.get("X-API-Key")
-    if not api_key: raise HTTPException(status_code=401)
+@limiter.limit("10/minute")
+async def predict(request: Request, pitch: TargetPitch, client_name: str = Security(get_client_identity)):
+    
+    target_df = pd.DataFrame([pitch.model_dump()])
+    result = recommend_arsenal(target_df)
+    
+    # NEW: Async logging - The system now remembers what it did
+    import asyncio
+    asyncio.create_task(log_prediction(client_name, pitch.model_dump(), result))
+    
+    return {
+        "status": "success",
+        "client_billed": client_name,
+        "prediction": result
+    }
 
     # Run Math
     input_dict = pitch.model_dump()
