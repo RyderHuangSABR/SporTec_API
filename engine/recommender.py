@@ -30,17 +30,17 @@ _XGB_MODELS = {}
 def get_db_connection():
     global _DB_CONNECTION
     if _DB_CONNECTION is None:
-        print("⚙️ Fetching DuckDB Vault from HuggingFace...")
+        print(" Fetching DuckDB Vault from HuggingFace...")
         file_path = hf_hub_download(repo_id=DATA_REPO, filename="Atlas/cleaned_pitch_data.parquet", repo_type="dataset", token=HF_TOKEN)
         _DB_CONNECTION = duckdb.connect(database=':memory:')
         _DB_CONNECTION.execute(f"CREATE OR REPLACE VIEW mlb_history AS SELECT * FROM read_parquet('{file_path}')")
-        print("💎 Historical Vault Armed.")
+        print(" Historical Vault Armed.")
     return _DB_CONNECTION
 
 def get_xgb_models():
     global _XGB_MODELS
     if not _XGB_MODELS:
-        print("⚙️ Fetching 14 XGBoost Simulation Engines...")
+        print(" Fetching 14 XGBoost Simulation Engines...")
         for pitch in PITCH_TYPES:
             _XGB_MODELS[pitch] = {}
             for engine, prefix in [("A_Whiff", "Engine_A_Whiff"), ("B_Contact", "Engine_B_Contact")]:
@@ -49,7 +49,7 @@ def get_xgb_models():
                 model = xgb.Booster()
                 model.load_model(file_path)
                 _XGB_MODELS[pitch][engine] = model
-        print("🔥 XGBoost Simulation Engines Armed.")
+        print("XGBoost Simulation Engines Armed.")
     return _XGB_MODELS
 
 # =====================================================================
@@ -143,7 +143,7 @@ def recommend_arsenal(target_df):
                     "arsenal_rank": rank,
                     "pitch_type": p_data["pitch_type"],
                     "simulated_score": round(float(p_data["score"]), 3),
-                    "risk_profile": "✅ VALIDATED (Safe Chassis Match)",
+                    "risk_profile": "VALIDATED (Safe Chassis Match)",
                     "validation": {
                         "twin_mlbid": int(best_clone['MLBID']),
                         "twin_spin_axis": round(float(best_clone['spin_axis']), 1),
