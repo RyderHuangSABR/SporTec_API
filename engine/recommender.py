@@ -13,14 +13,20 @@ ML_REPO = "RyderHuangSABR/Atlas_Pitching_ML"
 
 PITCH_TYPES = ["Fastball", "Sinker", "Cutter", "SplitterFork", "Curveball", "Changeup", "SweeperSlider"]
 
+# THE MATH FIX: Standardized Weights (Desired Importance / MLB Variance)
 XGB_WEIGHTS = {
-    "vaa": 10.0, "haa": 10.0, "extension": 5.0, 
-    "pos_z": 8.0, "pos_x": 8.0, "velo_delta": 3.0, "spin_axis": 0.1
+    "vaa": 10.0 / 1.5,       
+    "haa": 10.0 / 2.0,       
+    "extension": 5.0 / 0.5,  
+    "pos_z": 8.0 / 0.6,      
+    "pos_x": 8.0 / 1.0,      
+    "velo_delta": 3.0 / 4.0, 
+    "spin_axis": 2.0 / 45.0  # Prevents spin axis from dominating the math
 }
 
 CHASSIS_TOLERANCE_FT = 0.5 
 
-# Global caches
+# Global Caches (This is how DuckDB "memorizes" the data)
 _DB_CONNECTION = None
 _XGB_MODELS = {}
 
@@ -30,26 +36,44 @@ _XGB_MODELS = {}
 def get_db_connection():
     global _DB_CONNECTION
     if _DB_CONNECTION is None:
-        print(" Fetching DuckDB Vault from HuggingFace...")
-        file_path = hf_hub_download(repo_id=DATA_REPO, filename="Atlas/cleaned_pitch_data.parquet", repo_type="dataset", token=HF_TOKEN)
+        print("🦆 Fetching DuckDB Vault from HuggingFace (Atlas)...")
+        # Pulls from the Atlas folder specifically
+        file_path = hf_hub_download(
+            repo_id=DATA_REPO, 
+            filename="cleaned_pitch_data.parquet", 
+            subfolder="Atlas", 
+            repo_type="dataset", 
+            token=HF_TOKEN
+        )
+        
+        # Connect to an in-memory database for maximum speed
         _DB_CONNECTION = duckdb.connect(database=':memory:')
         _DB_CONNECTION.execute(f"CREATE OR REPLACE VIEW mlb_history AS SELECT * FROM read_parquet('{file_path}')")
-        print(" Historical Vault Armed.")
+        print("✅ Historical Vault Armed and Cached in RAM.")
     return _DB_CONNECTION
 
 def get_xgb_models():
     global _XGB_MODELS
     if not _XGB_MODELS:
-        print(" Fetching 14 XGBoost Simulation Engines...")
+        print("🤖 Fetching 14 XGBoost Simulation Engines from daily_pulls...")
         for pitch in PITCH_TYPES:
             _XGB_MODELS[pitch] = {}
             for engine, prefix in [("A_Whiff", "Engine_A_Whiff"), ("B_Contact", "Engine_B_Contact")]:
                 filename = f"{prefix}_{pitch}.json"
-                file_path = hf_hub_download(repo_id=ML_REPO, filename=filename, repo_type="model", token=HF_TOKEN)
+                
+                # Pointing strictly to the daily_pulls folder to get the freshest brain
+                file_path = hf_hub_download(
+                    repo_id=ML_REPO, 
+                    filename=filename, 
+                    subfolder="daily_pulls", 
+                    repo_type="model", 
+                    token=HF_TOKEN
+                )
+                
                 model = xgb.Booster()
                 model.load_model(file_path)
                 _XGB_MODELS[pitch][engine] = model
-        print("XGBoost Simulation Engines Armed.")
+        print("✅ XGBoost Simulation Engines Armed and Cached.")
     return _XGB_MODELS
 
 # =====================================================================
@@ -61,6 +85,7 @@ def recommend_arsenal(target_df):
     Applies 'Unicorn' tags to statistical outliers instead of rejecting them.
     """
     try:
+        # These function calls instantly return the cached objects if already loaded
         con = get_db_connection()
         models = get_xgb_models()
         
@@ -72,7 +97,8 @@ def recommend_arsenal(target_df):
             whiff_score = models[pitch]["A_Whiff"].predict(dmatrix_input)[0]
             contact_score = models[pitch]["B_Contact"].predict(dmatrix_input)[0]
             
-            composite_score = (whiff_score * 0.6) + (contact_score * 0.4) 
+            # THE MATH FIX: Subtract damage score instead of adding it
+            composite_score = (whiff_score * 0.6) - (contact_score * 0.4) 
             pitch_scores.append({"pitch_type": pitch, "score": composite_score})
             
         # Rank pitches mathematically and take the Top 3 to form an Arsenal
@@ -101,6 +127,7 @@ def recommend_arsenal(target_df):
         for rank, p_data in enumerate(top_3_pitches, start=1):
             target_pitch_code = statcast_pitch_code_map.get(p_data["pitch_type"], p_data["pitch_type"])
 
+            # DuckDB Euclidean Distance Query with Standardized Weights
             query = f"""
                 SELECT 
                     MLBID, 
@@ -165,6 +192,9 @@ def recommend_arsenal(target_df):
         print(f"Recommender Error: {e}")
         return {"status": "error", "message": "Engine Fault", "reason": str(e)}
 
+# =====================================================================
+# TEST EXECUTION
+# =====================================================================
 if __name__ == "__main__":
     sample_payload = pd.DataFrame([{
         "vaa": -5.2, "haa": 1.8, "release_extension": 6.8, "release_pos_z": 5.8,
