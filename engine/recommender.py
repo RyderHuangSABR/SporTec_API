@@ -4,6 +4,7 @@ import numpy as np
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
+from sklearn.neighbors import NearestNeighbors
 from flask import Flask, request, jsonify
 
 # ==========================================
@@ -11,7 +12,7 @@ from flask import Flask, request, jsonify
 # ==========================================
 
 FEATURES = [
-    'pitch_type', 'release_speed', 'effective_speed', 'release_spin_rate', 'spin_axis',
+    'release_speed', 'effective_speed', 'release_spin_rate', 'spin_axis',
     'pfx_x', 'pfx_z', 'release_pos_x', 'release_pos_z', 'release_extension', 
     'plate_x', 'plate_z', 'vaa', 'haa', 'commit_x', 'commit_z', 'reaction_time', 'movement_ratio'
 ]
@@ -46,15 +47,11 @@ def load_atlas_daily_pulls(base_dir="Atlas_Pitching_Data/daily_pulls"):
             if 'game_date' not in daily_df.columns:
                 daily_df['game_date'] = pd.to_datetime(file_date)
             df_list.append(daily_df)
-            print(f"  ✓ Loaded: {file.name} | Rows: {len(daily_df)}")
         except Exception as e:
             print(f"  ❌ Error loading {file.name}: {e}")
             
     master_df = pd.concat(df_list, ignore_index=True)
-    if 'game_date' in master_df.columns:
-        master_df = master_df.sort_values(by='game_date').reset_index(drop=True)
-    
-    print(f"\n✅ Atlas 2.0 Data Ingestion Complete. Total Pitches: {len(master_df)}")
+    print(f"✅ Atlas 2.0 Data Ingestion Complete. Total Pitches: {len(master_df)}")
     return master_df
 
 # ==========================================
@@ -63,94 +60,114 @@ def load_atlas_daily_pulls(base_dir="Atlas_Pitching_Data/daily_pulls"):
 
 def preprocess_atlas_data(df):
     """Cleans data and engineers the proprietary biological metrics."""
-    # Group the pitches to avoid Statcast classification noise
     df['pitch_group'] = df['pitch_type'].map(PITCH_GROUPS)
-    
-    # Drop rows where critical trajectory data is missing
     df = df.dropna(subset=['pfx_x', 'pfx_z', 'plate_x', 'plate_z'])
     
-    # --- PROPRIETARY ENGINEERING ---
-    # Calculate movement_ratio (Example: hypotenuse of total break vs velocity)
-    # Note: Adjust this to your specific secret formula
+    # Proprietary Engineering
     df['total_break'] = np.sqrt(df['pfx_x']**2 + df['pfx_z']**2)
     df['movement_ratio'] = df['total_break'] / df['release_speed']
-    
-    # Calculate reaction_time (Distance - Extension / Speed)
-    # 55 feet is roughly the release point distance
     df['reaction_time'] = (55 - df['release_extension']) / df['effective_speed']
     
     return df
 
 # ==========================================
-# 4. THE XGBOOST CORE (TRAINING)
+# 4. XGBOOST CORE (HEAVY ARTILLERY)
 # ==========================================
 
-def train_atlas_engine(df, target_col='contact_damage'):
+def train_xgboost_engine(df, target_col='contact_damage'):
     """Trains the XGBoost model to predict Contact Damage RMSE."""
     print("🧠 Initializing XGBoost Engine...")
     
-    X = df[FEATURES]
-    y = df[target_col]
-    
-    # One-hot encode categorical features (like pitch_type)
-    X = pd.get_dummies(X, columns=['pitch_type'], drop_first=True)
+    X = df[FEATURES].fillna(0)
+    y = df[target_col].fillna(0)
     
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # The actual algorithm
     model = xgb.XGBRegressor(
-        objective='reg:squarederror',
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42
+        objective='reg:squarederror', n_estimators=500, learning_rate=0.05,
+        max_depth=6, subsample=0.8, colsample_bytree=0.8, random_state=42
     )
     
     model.fit(X_train, y_train)
+    rmse = np.sqrt(mean_squared_error(y_test, model.predict(X_test)))
+    print(f"🎯 XGBoost Trained Successfully. Damage RMSE: {rmse:.3f}")
     
-    # Validation
-    preds = model.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, preds))
-    print(f"🎯 Model Trained Successfully. Contact Damage RMSE: {rmse:.3f}")
-    
-    return model, X.columns
+    return model
 
 # ==========================================
-# 5. THE DUGUOT API (FLASK ENDPOINT)
+# 5. WEIGHTED 1-NN CORE (THE SCALPEL)
+# ==========================================
+
+def build_weighted_recommender(xgb_model, df):
+    """Extracts XGBoost weights to bypass the Curse of Dimensionality for 1-NN."""
+    print("🧬 Initializing Weighted 1-NN Clone Engine...")
+    
+    # 1. Extract and normalize XGBoost feature importances
+    xgb_weights = xgb_model.feature_importances_
+    normalized_weights = xgb_weights / np.sum(xgb_weights)
+    
+    # 2. Apply weights to the raw dataset
+    X_raw = df[FEATURES].fillna(0).copy()
+    X_weighted = X_raw * normalized_weights
+    
+    # 3. Train the Nearest Neighbors model on the stretched/shrunk data
+    nn_model = NearestNeighbors(n_neighbors=2, metric='euclidean') # n=2 because index 0 is the pitch itself
+    nn_model.fit(X_weighted)
+    
+    print("✅ Clone Engine Online.")
+    return nn_model, normalized_weights
+
+def find_pitch_clone(target_features, nn_model, weights, original_df):
+    """Finds the closest historical pitch using the weighted engine."""
+    target_weighted = np.array(target_features) * weights
+    distance, index = nn_model.kneighbors([target_weighted])
+    
+    # index[0][1] gets the *first* nearest neighbor that isn't the exact same row
+    clone_idx = index[0][1]
+    clone_pitch = original_df.iloc[clone_idx]
+    
+    return clone_pitch, distance[0][1]
+
+# ==========================================
+# 6. THE DUGOUT API (FLASK ENDPOINT)
 # ==========================================
 
 app = Flask(__name__)
-# In a real deployment, the model and features would be loaded globally here.
-# global_model = None
-# global_features = None
+
+# Globals for the API to access the trained models
+atlas_df = None
+xgb_engine = None
+nn_engine = None
+feature_weights = None
 
 @app.route('/predict_pitch', methods=['POST'])
 def predict_pitch():
-    """
-    The exact API endpoint Patrick Bailey hits from the iPad.
-    Expects a JSON payload with the pitcher's chassis data.
-    """
+    """The dual-engine payload for Patrick Bailey's iPad."""
     try:
         incoming_data = request.get_json()
+        pitch_df = pd.DataFrame([incoming_data]).reindex(columns=FEATURES, fill_value=0)
         
-        # Convert incoming JSON to DataFrame
-        pitch_df = pd.DataFrame([incoming_data])
+        # 1. Get XGBoost Damage Prediction
+        predicted_damage = xgb_engine.predict(pitch_df)[0]
         
-        # Ensure all columns match the trained model (dummy columns included)
-        # pitch_df = pitch_df.reindex(columns=global_features, fill_value=0)
+        # 2. Get Weighted 1-NN Historical Clone
+        target_array = pitch_df.iloc[0].values
+        clone, distance = find_pitch_clone(target_array, nn_engine, feature_weights, atlas_df)
         
-        # Run the prediction
-        # prediction = global_model.predict(pitch_df)[0]
-        prediction = 0.321 # Hardcoded for demonstration
-        
-        # The payload that goes back to the dugout
+        # 3. Assemble the Ultimate Payload
         response = {
             "status": "success",
             "pitcher": incoming_data.get("pitcher_name", "Unknown"),
-            "predicted_contact_damage_rmse": float(prediction),
-            "recommendation": "DO NOT THROW" if prediction > 0.400 else "EXECUTE SEQUENCE"
+            "xgboost_analysis": {
+                "predicted_contact_damage_rmse": float(predicted_damage),
+                "recommendation": "DO NOT THROW" if predicted_damage > 0.400 else "EXECUTE SEQUENCE"
+            },
+            "historical_clone_analysis": {
+                "clone_pitcher": clone.get("pitcher_name", "Unknown Historical"),
+                "clone_pitch_type": clone.get("pitch_type", "Unknown"),
+                "similarity_distance": float(distance),
+                "historical_result": clone.get("events", "Unknown Outcome")
+            }
         }
         
         return jsonify(response), 200
@@ -159,20 +176,18 @@ def predict_pitch():
         return jsonify({"status": "error", "message": str(e)}), 400
 
 # ==========================================
-# EXECUTION BLOCK (LOCAL TESTING)
+# EXECUTION BLOCK
 # ==========================================
 if __name__ == "__main__":
-    print("🚀 Booting Atlas 2.0 System...")
+    print("🚀 Booting Atlas 2.0 Master System...")
+    # NOTE: Uncomment to run live
     
-    # 1. Load Data
-    # raw_data = load_atlas_daily_pulls()
+    # 1. Load & Process Data
+    # atlas_df = preprocess_atlas_data(load_atlas_daily_pulls())
     
-    # 2. Process
-    # clean_data = preprocess_atlas_data(raw_data)
+    # 2. Train Both Engines
+    # xgb_engine = train_xgboost_engine(atlas_df)
+    # nn_engine, feature_weights = build_weighted_recommender(xgb_engine, atlas_df)
     
-    # 3. Train
-    # global_model, global_features = train_atlas_engine(clean_data)
-    
-    # 4. Launch API
-    print("📡 Launching Dugout API on Port 5000...")
-    app.run(host='0.0.0.0', port=5000)
+    # 3. Launch the API
+    # app.run(host='0.0.0.0', port=5000)
