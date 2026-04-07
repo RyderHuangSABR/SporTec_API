@@ -40,7 +40,7 @@ def get_db_connection():
         # Pulls from the Atlas folder specifically
         file_path = hf_hub_download(
             repo_id=DATA_REPO, 
-            filename="cleaned_pitch_data.parquet", 
+            filename="Atlas_Pitching.parquet", 
             subfolder="Atlas", 
             repo_type="dataset", 
             token=HF_TOKEN
