@@ -1,207 +1,178 @@
-import os
 import pandas as pd
-import duckdb
 import xgboost as xgb
-from huggingface_hub import hf_hub_download
+import numpy as np
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+from flask import Flask, request, jsonify
 
-# =====================================================================
-# 🧠 ATLAS ENGINE HYPERPARAMETERS & CONFIG
-# =====================================================================
-HF_TOKEN = os.getenv("HF_TOKEN")
-DATA_REPO = "RyderHuangSABR/Atlas_Pitching_Data"
-ML_REPO = "RyderHuangSABR/Atlas_Pitching_ML"
+# ==========================================
+# 1. THE ATLAS CONFIGURATION (CONSTANTS)
+# ==========================================
 
-PITCH_TYPES = ["Fastball", "Sinker", "Cutter", "SplitterFork", "Curveball", "Changeup", "SweeperSlider"]
+FEATURES = [
+    'pitch_type', 'release_speed', 'effective_speed', 'release_spin_rate', 'spin_axis',
+    'pfx_x', 'pfx_z', 'release_pos_x', 'release_pos_z', 'release_extension', 
+    'plate_x', 'plate_z', 'vaa', 'haa', 'commit_x', 'commit_z', 'reaction_time', 'movement_ratio'
+]
 
-# THE MATH FIX: Standardized Weights (Desired Importance / MLB Variance)
-XGB_WEIGHTS = {
-    "vaa": 10.0 / 1.5,       
-    "haa": 10.0 / 2.0,       
-    "extension": 5.0 / 0.5,  
-    "pos_z": 8.0 / 0.6,      
-    "pos_x": 8.0 / 1.0,      
-    "velo_delta": 3.0 / 4.0, 
-    "spin_axis": 2.0 / 45.0  # Prevents spin axis from dominating the math
+PITCH_GROUPS = {
+    "FF": "Fastball", "SI": "Sinker", "FC": "Cutter", "CH": "Changeup",
+    "FS": "SplitterFork", "FO": "SplitterFork", "ST": "SweeperSlider",
+    "SL": "SweeperSlider", "SW": "SweeperSlider", "CU": "Curveball",
+    "KC": "Curveball", "CS": "Curveball"
 }
 
-CHASSIS_TOLERANCE_FT = 0.5 
+# ==========================================
+# 2. THE DATA INGESTION ENGINE (PARQUET)
+# ==========================================
 
-# Global Caches (This is how DuckDB "memorizes" the data)
-_DB_CONNECTION = None
-_XGB_MODELS = {}
-
-# =====================================================================
-# 🛠️ SYSTEM BOOTSTRAP
-# =====================================================================
-def get_db_connection():
-    global _DB_CONNECTION
-    if _DB_CONNECTION is None:
-        print("🦆 Fetching DuckDB Vault from HuggingFace (Atlas)...")
-        # Pulls from the Atlas folder specifically
-        file_path = hf_hub_download(
-            repo_id=DATA_REPO, 
-            filename="Atlas_Pitching.parquet", 
-            subfolder="Atlas", 
-            repo_type="dataset", 
-            token=HF_TOKEN
-        )
+def load_atlas_daily_pulls(base_dir="Atlas_Pitching_Data/daily_pulls"):
+    """Scrapes the directory for daily Parquet files and concatenates them."""
+    data_path = Path(base_dir)
+    parquet_files = list(data_path.glob("Pitches_*.parquet"))
+    
+    if not parquet_files:
+        print(f"⚠️ Warning: No daily pulls found in {base_dir}")
+        return pd.DataFrame()
         
-        # Connect to an in-memory database for maximum speed
-        _DB_CONNECTION = duckdb.connect(database=':memory:')
-        _DB_CONNECTION.execute(f"CREATE OR REPLACE VIEW mlb_history AS SELECT * FROM read_parquet('{file_path}')")
-        print("✅ Historical Vault Armed and Cached in RAM.")
-    return _DB_CONNECTION
+    print(f"📊 Discovered {len(parquet_files)} daily parquet files. Initiating ingestion...")
+    
+    df_list = []
+    for file in parquet_files:
+        try:
+            file_date = file.stem.split('_')[1]
+            daily_df = pd.read_parquet(file)
+            if 'game_date' not in daily_df.columns:
+                daily_df['game_date'] = pd.to_datetime(file_date)
+            df_list.append(daily_df)
+            print(f"  ✓ Loaded: {file.name} | Rows: {len(daily_df)}")
+        except Exception as e:
+            print(f"  ❌ Error loading {file.name}: {e}")
+            
+    master_df = pd.concat(df_list, ignore_index=True)
+    if 'game_date' in master_df.columns:
+        master_df = master_df.sort_values(by='game_date').reset_index(drop=True)
+    
+    print(f"\n✅ Atlas 2.0 Data Ingestion Complete. Total Pitches: {len(master_df)}")
+    return master_df
 
-def get_xgb_models():
-    global _XGB_MODELS
-    if not _XGB_MODELS:
-        print("🤖 Fetching 14 XGBoost Simulation Engines from daily_pulls...")
-        for pitch in PITCH_TYPES:
-            _XGB_MODELS[pitch] = {}
-            for engine, prefix in [("A_Whiff", "Engine_A_Whiff"), ("B_Contact", "Engine_B_Contact")]:
-                filename = f"{prefix}_{pitch}.json"
-                
-                # Pointing strictly to the daily_pulls folder to get the freshest brain
-                file_path = hf_hub_download(
-                    repo_id=ML_REPO, 
-                    filename=filename, 
-                    subfolder="daily_pulls", 
-                    repo_type="model", 
-                    token=HF_TOKEN
-                )
-                
-                model = xgb.Booster()
-                model.load_model(file_path)
-                _XGB_MODELS[pitch][engine] = model
-        print("✅ XGBoost Simulation Engines Armed and Cached.")
-    return _XGB_MODELS
+# ==========================================
+# 3. THE BIOMECHANICAL PRE-PROCESSOR
+# ==========================================
 
-# =====================================================================
-# 🚀 THE ORACLE (The Core API Endpoint)
-# =====================================================================
-def recommend_arsenal(target_df):
+def preprocess_atlas_data(df):
+    """Cleans data and engineers the proprietary biological metrics."""
+    # Group the pitches to avoid Statcast classification noise
+    df['pitch_group'] = df['pitch_type'].map(PITCH_GROUPS)
+    
+    # Drop rows where critical trajectory data is missing
+    df = df.dropna(subset=['pfx_x', 'pfx_z', 'plate_x', 'plate_z'])
+    
+    # --- PROPRIETARY ENGINEERING ---
+    # Calculate movement_ratio (Example: hypotenuse of total break vs velocity)
+    # Note: Adjust this to your specific secret formula
+    df['total_break'] = np.sqrt(df['pfx_x']**2 + df['pfx_z']**2)
+    df['movement_ratio'] = df['total_break'] / df['release_speed']
+    
+    # Calculate reaction_time (Distance - Extension / Speed)
+    # 55 feet is roughly the release point distance
+    df['reaction_time'] = (55 - df['release_extension']) / df['effective_speed']
+    
+    return df
+
+# ==========================================
+# 4. THE XGBOOST CORE (TRAINING)
+# ==========================================
+
+def train_atlas_engine(df, target_col='contact_damage'):
+    """Trains the XGBoost model to predict Contact Damage RMSE."""
+    print("🧠 Initializing XGBoost Engine...")
+    
+    X = df[FEATURES]
+    y = df[target_col]
+    
+    # One-hot encode categorical features (like pitch_type)
+    X = pd.get_dummies(X, columns=['pitch_type'], drop_first=True)
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # The actual algorithm
+    model = xgb.XGBRegressor(
+        objective='reg:squarederror',
+        n_estimators=500,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42
+    )
+    
+    model.fit(X_train, y_train)
+    
+    # Validation
+    preds = model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
+    print(f"🎯 Model Trained Successfully. Contact Damage RMSE: {rmse:.3f}")
+    
+    return model, X.columns
+
+# ==========================================
+# 5. THE DUGUOT API (FLASK ENDPOINT)
+# ==========================================
+
+app = Flask(__name__)
+# In a real deployment, the model and features would be loaded globally here.
+# global_model = None
+# global_features = None
+
+@app.route('/predict_pitch', methods=['POST'])
+def predict_pitch():
     """
-    Returns a top-3 Pitch Arsenal.
-    Applies 'Unicorn' tags to statistical outliers instead of rejecting them.
+    The exact API endpoint Patrick Bailey hits from the iPad.
+    Expects a JSON payload with the pitcher's chassis data.
     """
     try:
-        # These function calls instantly return the cached objects if already loaded
-        con = get_db_connection()
-        models = get_xgb_models()
+        incoming_data = request.get_json()
         
-        # --- STEP 1: THE SIMULATION (XGBoost) ---
-        dmatrix_input = xgb.DMatrix(target_df)
-        pitch_scores = []
+        # Convert incoming JSON to DataFrame
+        pitch_df = pd.DataFrame([incoming_data])
         
-        for pitch in PITCH_TYPES:
-            whiff_score = models[pitch]["A_Whiff"].predict(dmatrix_input)[0]
-            contact_score = models[pitch]["B_Contact"].predict(dmatrix_input)[0]
-            
-            # THE MATH FIX: Subtract damage score instead of adding it
-            composite_score = (whiff_score * 0.6) - (contact_score * 0.4) 
-            pitch_scores.append({"pitch_type": pitch, "score": composite_score})
-            
-        # Rank pitches mathematically and take the Top 3 to form an Arsenal
-        pitch_scores = sorted(pitch_scores, key=lambda x: x["score"], reverse=True)
-        top_3_pitches = pitch_scores[:3]
-
-        # --- STEP 2: THE REALITY CHECK (DuckDB 1-NN) ---
-        t_vaa = float(target_df['vaa'].iloc[0])
-        t_haa = float(target_df['haa'].iloc[0])
-        t_ext = float(target_df['release_extension'].iloc[0])
-        t_z = float(target_df['release_pos_z'].iloc[0])
-        t_x = float(target_df['release_pos_x'].iloc[0])
-        t_fb_speed = float(target_df['fastball_speed'].iloc[0]) 
-        t_speed = float(target_df['release_speed'].iloc[0])
-        t_velo_delta = t_fb_speed - t_speed 
-        t_axis = float(target_df['spin_axis'].iloc[0])
-        t_hand = str(target_df['p_throws'].iloc[0]).upper()
-
-        statcast_pitch_code_map = {
-            "Changeup": "CH", "SweeperSlider": "ST", "Curveball": "CU", 
-            "SplitterFork": "FS", "Fastball": "FF", "Sinker": "SI", "Cutter": "FC"
-        }
-
-        final_arsenal = []
-
-        for rank, p_data in enumerate(top_3_pitches, start=1):
-            target_pitch_code = statcast_pitch_code_map.get(p_data["pitch_type"], p_data["pitch_type"])
-
-            # DuckDB Euclidean Distance Query with Standardized Weights
-            query = f"""
-                SELECT 
-                    MLBID, 
-                    spin_axis,
-                    pfx_x,
-                    pfx_z,
-                    SQRT(
-                        POWER((vaa - ({t_vaa})) * {XGB_WEIGHTS['vaa']}, 2) + 
-                        POWER((haa - ({t_haa})) * {XGB_WEIGHTS['haa']}, 2) + 
-                        POWER((release_extension - ({t_ext})) * {XGB_WEIGHTS['extension']}, 2) + 
-                        POWER((release_pos_z - ({t_z})) * {XGB_WEIGHTS['pos_z']}, 2) + 
-                        POWER((release_pos_x - ({t_x})) * {XGB_WEIGHTS['pos_x']}, 2) + 
-                        POWER(((fastball_speed - release_speed) - ({t_velo_delta})) * {XGB_WEIGHTS['velo_delta']}, 2) +
-                        POWER(LEAST(ABS(spin_axis - ({t_axis})), 360 - ABS(spin_axis - ({t_axis}))) * {XGB_WEIGHTS['spin_axis']}, 2)
-                    ) as kinematic_distance
-                FROM mlb_history
-                WHERE pitch_type = '{target_pitch_code}' 
-                AND p_throws = '{t_hand}'
-                AND release_pos_z BETWEEN ({t_z} - {CHASSIS_TOLERANCE_FT}) AND ({t_z} + {CHASSIS_TOLERANCE_FT})
-                AND release_pos_x BETWEEN ({t_x} - {CHASSIS_TOLERANCE_FT}) AND ({t_x} + {CHASSIS_TOLERANCE_FT})
-                AND release_extension BETWEEN ({t_ext} - {CHASSIS_TOLERANCE_FT}) AND ({t_ext} + {CHASSIS_TOLERANCE_FT})
-                ORDER BY kinematic_distance ASC
-                LIMIT 1
-            """
-            
-            clone = con.execute(query).df()
-
-            # The Outlier/Unicorn Logic
-            if clone.empty:
-                pitch_profile = {
-                    "arsenal_rank": rank,
-                    "pitch_type": p_data["pitch_type"],
-                    "simulated_score": round(float(p_data["score"]), 3),
-                    "risk_profile": "🦄 UNICORN (High Reward / High Risk)",
-                    "validation": "No historical twin found within 0.5ft chassis tolerance. This pitch is statistically elite but biomechanically unprecedented."
-                }
-            else:
-                best_clone = clone.iloc[0]
-                pitch_profile = {
-                    "arsenal_rank": rank,
-                    "pitch_type": p_data["pitch_type"],
-                    "simulated_score": round(float(p_data["score"]), 3),
-                    "risk_profile": "VALIDATED (Safe Chassis Match)",
-                    "validation": {
-                        "twin_mlbid": int(best_clone['MLBID']),
-                        "twin_spin_axis": round(float(best_clone['spin_axis']), 1),
-                        "twin_pfx_x": round(float(best_clone['pfx_x']), 1),
-                        "twin_pfx_z": round(float(best_clone['pfx_z']), 1),
-                        "kinematic_distance": round(float(best_clone['kinematic_distance']), 3)
-                    }
-                }
-            
-            final_arsenal.append(pitch_profile)
-
-        return {
+        # Ensure all columns match the trained model (dummy columns included)
+        # pitch_df = pitch_df.reindex(columns=global_features, fill_value=0)
+        
+        # Run the prediction
+        # prediction = global_model.predict(pitch_df)[0]
+        prediction = 0.321 # Hardcoded for demonstration
+        
+        # The payload that goes back to the dugout
+        response = {
             "status": "success",
-            "message": "Atlas Engine calculated Top 3 optimized arsenal.",
-            "arsenal": final_arsenal
+            "pitcher": incoming_data.get("pitcher_name", "Unknown"),
+            "predicted_contact_damage_rmse": float(prediction),
+            "recommendation": "DO NOT THROW" if prediction > 0.400 else "EXECUTE SEQUENCE"
         }
         
-    except Exception as e:
-        print(f"Recommender Error: {e}")
-        return {"status": "error", "message": "Engine Fault", "reason": str(e)}
+        return jsonify(response), 200
 
-# =====================================================================
-# TEST EXECUTION
-# =====================================================================
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+# ==========================================
+# EXECUTION BLOCK (LOCAL TESTING)
+# ==========================================
 if __name__ == "__main__":
-    sample_payload = pd.DataFrame([{
-        "vaa": -5.2, "haa": 1.8, "release_extension": 6.8, "release_pos_z": 5.8,
-        "release_pos_x": -2.1, "fastball_speed": 94.5, "release_speed": 85.2,
-        "spin_axis": 210, "p_throws": "R"
-    }])
+    print("🚀 Booting Atlas 2.0 System...")
     
-    result = recommend_arsenal(sample_payload)
-    import json
-    print(json.dumps(result, indent=2))
+    # 1. Load Data
+    # raw_data = load_atlas_daily_pulls()
+    
+    # 2. Process
+    # clean_data = preprocess_atlas_data(raw_data)
+    
+    # 3. Train
+    # global_model, global_features = train_atlas_engine(clean_data)
+    
+    # 4. Launch API
+    print("📡 Launching Dugout API on Port 5000...")
+    app.run(host='0.0.0.0', port=5000)
