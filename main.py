@@ -8,7 +8,12 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
+
 from pydantic import BaseModel
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from engine.recommender import recommend_arsenal
 
@@ -16,11 +21,16 @@ from engine.recommender import recommend_arsenal
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas_api")
 
-# --- APP ---
+# --- APP INIT ---
 app = FastAPI(
     title="Atlas Pitching Analytics API",
     version="2.0.0"
 )
+
+# --- RATE LIMITING ---
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- CORS ---
 app.add_middleware(
@@ -31,19 +41,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATABASE ---
+# --- DATABASE INIT ---
 def init_db():
-    conn = duckdb.connect("atlas_application.db")
-    
-    conn.execute("""
+    db = duckdb.connect("atlas_application.db")
+    db.execute("""
         CREATE TABLE IF NOT EXISTS api_clients (
             api_key TEXT PRIMARY KEY,
             client_name TEXT,
             tier TEXT
-        )
+        );
     """)
-
-    conn.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS telemetry_logs (
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             client_name TEXT,
@@ -53,10 +61,9 @@ def init_db():
             recommended_pitch TEXT,
             kinematic_distance DOUBLE,
             apex_clone_mlbid INTEGER
-        )
+        );
     """)
-
-    return conn
+    return db
 
 db = init_db()
 
@@ -108,24 +115,39 @@ def log_application_telemetry(client_name: str, pitch_data: dict, recommendation
             recommendation.get("apex_clone_mlbid", 0)
         ])
     except Exception as e:
-        logger.error(f"Telemetry error: {e}")
+        logger.error(f"Telemetry failed: {e}")
 
 # --- ROUTES ---
 
+# ✅ ROOT (fixes your looping issue)
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "service": "Atlas API",
+        "docs": "/docs"
+    }
 
+# ✅ HEALTH CHECK
 @app.get("/health")
-async def health():
-    return {"status": "healthy"}
+@limiter.limit("5/minute")
+async def health_check(request: Request):
+    return {
+        "status": "healthy",
+        "service": "Atlas API"
+    }
 
+# ✅ PREDICTION
 @app.post("/api/v1/predict")
+@limiter.limit("10/minute")
 async def predict_pitch(
+    request: Request,
     pitch: TargetPitch,
     background_tasks: BackgroundTasks,
     client_name: str = Security(authenticate_client)
 ):
+    logger.info(f"Prediction request from: {client_name}")
+
     try:
         df = pd.DataFrame([pitch.model_dump()])
         result = recommend_arsenal(df)
@@ -147,6 +169,7 @@ async def predict_pitch(
         logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail="Prediction failed")
 
+# ✅ ADMIN KEY GENERATION
 @app.post("/admin/generate_key")
 async def generate_api_key(req: APIKeyRequest):
     expected_password = os.getenv("ATLAS_ADMIN_SECRET")
