@@ -29,23 +29,34 @@ PITCH_GROUPS = {
 # ==========================================
 
 def load_atlas_daily_pulls(base_dir="Atlas_Pitching_Data/daily_pulls"):
-    """Scrapes the directory for daily Parquet files and concatenates them."""
+    """Scrapes the directory for daily Parquet files and the specific Atlas master file."""
     data_path = Path(base_dir)
+    master_file_path = Path("Atlas_Pitching_Data/Atlas/Altas_Pitching.parquet")
+    
+    # Discovery: Daily pulls + the hardcoded master file
     parquet_files = list(data_path.glob("Pitches_*.parquet"))
+    if master_file_path.exists():
+        parquet_files.append(master_file_path)
     
     if not parquet_files:
-        print(f"⚠️ Warning: No daily pulls found in {base_dir}")
+        print(f"⚠️ Warning: No files found in {base_dir} or at {master_file_path}")
         return pd.DataFrame()
         
-    print(f"📊 Discovered {len(parquet_files)} daily parquet files. Initiating ingestion...")
+    print(f"📊 Discovered {len(parquet_files)} files. Initiating ingestion...")
     
     df_list = []
     for file in parquet_files:
         try:
-            file_date = file.stem.split('_')[1]
             daily_df = pd.read_parquet(file)
+            
+            # Extract date from filename only if it follows the Pitches_YYYY-MM-DD format
             if 'game_date' not in daily_df.columns:
-                daily_df['game_date'] = pd.to_datetime(file_date)
+                if "Pitches_" in file.name:
+                    file_date = file.stem.split('_')[1]
+                    daily_df['game_date'] = pd.to_datetime(file_date)
+                else:
+                    daily_df['game_date'] = pd.NaT
+            
             df_list.append(daily_df)
         except Exception as e:
             print(f"  ❌ Error loading {file.name}: {e}")
