@@ -7,6 +7,8 @@ from sklearn.metrics import mean_squared_error
 from sklearn.neighbors import NearestNeighbors
 
 # Import constants from your features module
+from engine.loader import get_models_for_pitch
+from engine.scoring import score_pitch
 from engine.features import FEATURES, PITCH_GROUPS
 
 logger = logging.getLogger(__name__)
