@@ -5,6 +5,7 @@ import logging
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 
 # Import constants from your features module
 from engine.loader import get_models_for_pitch
@@ -21,13 +22,20 @@ def preprocess_atlas_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Cleans incoming Statcast data and engineers biomechanical metrics.
     """
-    df['pitch_group'] = df['pitch_type'].map(PITCH_GROUPS)
-    df = df.dropna(subset=['pfx_x', 'pfx_z', 'plate_x', 'plate_z'])
+    # Drop NAs first, then use .copy() to avoid SettingWithCopyWarning
+    clean_cols = ['pfx_x', 'pfx_z', 'plate_x', 'plate_z', 'release_speed', 'effective_speed']
+    df = df.dropna(subset=clean_cols).copy()
+    
+    # Safely map groups
+    df['pitch_group'] = df['pitch_type'].map(PITCH_GROUPS).fillna('Unknown')
     
     # Kinematic Engineering
     df['total_break'] = np.sqrt(df['pfx_x']**2 + df['pfx_z']**2)
     df['movement_ratio'] = df['total_break'] / df['release_speed']
-    df['reaction_time'] = (55 - df['release_extension']) / df['effective_speed']
+    
+    # Prevent division by zero if effective_speed is missing or corrupted
+    safe_speed = np.where(df['effective_speed'] == 0, 1e-5, df['effective_speed'])
+    df['reaction_time'] = (55 - df['release_extension']) / safe_speed
     
     return df
 
@@ -53,10 +61,13 @@ def train_xgboost_model(df: pd.DataFrame, target_col: str = 'contact_damage') ->
         max_depth=6, 
         subsample=0.8, 
         colsample_bytree=0.8, 
+        early_stopping_rounds=50, # Prevents overfitting
         random_state=42
     )
     
-    model.fit(X_train, y_train)
+    # Passing eval_set to track early stopping
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    
     rmse = np.sqrt(mean_squared_error(y_test, model.predict(X_test)))
     logger.info(f"XGBoost training complete. Validation Damage RMSE: {rmse:.3f}")
     
@@ -77,33 +88,57 @@ def build_weighted_knn(xgb_model: xgb.XGBRegressor, df: pd.DataFrame):
     xgb_weights = xgb_model.feature_importances_
     normalized_weights = xgb_weights / np.sum(xgb_weights)
     
-    # Apply weights to the raw dataset
     X_raw = df[FEATURES].fillna(0).copy()
-    X_weighted = X_raw * normalized_weights
     
-    # Train the Nearest Neighbors model on the dimensionally adjusted data
+    # CRITICAL FIX: Scale the data before applying weights. 
+    # Otherwise, features with large scales (spin rate) ruin the Euclidean distance.
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_raw)
+    
+    # Apply importance weights to the normalized dataset
+    X_weighted = X_scaled * normalized_weights
+    
+    # Train the Nearest Neighbors model
     nn_model = NearestNeighbors(n_neighbors=2, metric='euclidean')
     nn_model.fit(X_weighted)
     
     logger.info("Weighted 1-NN model fitted successfully.")
-    return nn_model, normalized_weights
+    return nn_model, scaler, normalized_weights
 
-def get_historical_clone(target_features: np.ndarray, nn_model: NearestNeighbors, weights: np.ndarray, original_df: pd.DataFrame):
+def get_historical_clone(
+    target_features: np.ndarray, 
+    nn_model: NearestNeighbors, 
+    scaler: StandardScaler, 
+    weights: np.ndarray, 
+    original_df: pd.DataFrame
+):
     """
     Identifies the most mathematically similar historical pitch based on weighted Euclidean distance.
     """
-    target_weighted = np.array(target_features) * weights
-    distances, indices = nn_model.kneighbors([target_weighted])
+    # Ensure 2D shape, scale, and weight the target features
+    target_reshaped = np.array(target_features).reshape(1, -1)
+    target_scaled = scaler.transform(target_reshaped)
+    target_weighted = target_scaled * weights
     
-    # indices[0][1] retrieves the nearest neighbor, excluding the target pitch itself
-    clone_idx = indices[0][1]
+    distances, indices = nn_model.kneighbors(target_weighted)
+    
+    # CRITICAL FIX: If distance to index 0 is ~0, the pitch is already in the dataset. 
+    # If the distance > 0, it's a new pitch, and index 0 is the actual clone.
+    if distances[0][0] < 1e-6:
+        clone_idx = indices[0][1]
+        clone_dist = distances[0][1]
+    else:
+        clone_idx = indices[0][0]
+        clone_dist = distances[0][0]
+        
     clone_pitch = original_df.iloc[clone_idx]
     
-    return clone_pitch, distances[0][1]
+    return clone_pitch, clone_dist
 
 def recommend_arsenal(
     target_features: np.ndarray,
     nn_model: NearestNeighbors,
+    scaler: StandardScaler,
     weights: np.ndarray,
     df: pd.DataFrame,
     pitcher_id_col: str = "pitcher",
@@ -111,19 +146,12 @@ def recommend_arsenal(
 ) -> dict:
     """
     Recommends a pitch arsenal based on the nearest historical pitch clone.
-    
-    Returns:
-        {
-            "clone_pitch": pd.Series,
-            "distance": float,
-            "arsenal": pd.DataFrame
-        }
     """
     logger.info("Generating arsenal recommendation via 1-NN clone...")
     
     # Step 1: Find nearest neighbor (clone)
     clone_pitch, distance = get_historical_clone(
-        target_features, nn_model, weights, df
+        target_features, nn_model, scaler, weights, df
     )
     
     # Step 2: Identify the pitcher of the clone
@@ -137,28 +165,19 @@ def recommend_arsenal(
         return {
             "clone_pitch": clone_pitch,
             "distance": distance,
-            "arsenal": pd.DataFrame()
+            "arsenal": pd.DataFrame(),
+            "group_arsenal": None
         }
     
     # Step 4: Build arsenal (pitch mix)
-    arsenal = (
-        pitcher_df[pitch_type_col]
-        .value_counts(normalize=True)
-        .reset_index()
-    )
-    
+    arsenal = pitcher_df[pitch_type_col].value_counts(normalize=True).reset_index()
     arsenal.columns = ["pitch_type", "usage"]
     
     # Optional: map to pitch groups
+    group_arsenal = None
     if "pitch_group" in pitcher_df.columns:
-        group_arsenal = (
-            pitcher_df["pitch_group"]
-            .value_counts(normalize=True)
-            .reset_index()
-        )
+        group_arsenal = pitcher_df["pitch_group"].value_counts(normalize=True).reset_index()
         group_arsenal.columns = ["pitch_group", "usage"]
-    else:
-        group_arsenal = None
     
     logger.info(f"Arsenal generated for pitcher {clone_pitcher_id}")
     
