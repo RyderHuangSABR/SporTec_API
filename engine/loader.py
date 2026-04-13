@@ -11,6 +11,30 @@ MODEL_REPO = "RyderHuangSABR/Atlas_Pitching_ML"
 
 _MODEL_CACHE = {}
 
+def load_atlas_data():
+    """Pulls the master historical file and the player dictionary."""
+    logger.info("Fetching Master Data and Dictionary...")
+    
+    # 1. Fetch the master pitching data
+    data_path = hf_hub_download(
+        repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
+        filename="Atlas_Pitching.parquet", 
+        repo_type="dataset", # Specify it's a dataset repo
+        token=HF_TOKEN
+    )
+    df_master = pd.read_parquet(data_path)
+    
+    # 2. Fetch the player dictionary
+    dict_path = hf_hub_download(
+        repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
+        filename="MLB_Player_Dictionary.parquet", 
+        repo_type="dataset",
+        token=HF_TOKEN
+    )
+    df_dict = pd.read_parquet(dict_path)
+    
+    return df_master, df_dict
+
 def get_models_for_pitch(statcast_code: str):
     """Retrieves and caches XGBoost models from Hugging Face for a given pitch type."""
     global _MODEL_CACHE
