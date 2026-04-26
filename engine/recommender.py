@@ -110,33 +110,54 @@ def get_historical_clone(
     nn_model: NearestNeighbors, 
     scaler: StandardScaler, 
     weights: np.ndarray, 
-    original_df: pd.DataFrame
+    original_df: pd.DataFrame,
+    target_z: float, # Passing the raw Z coordinate
+    target_x: float, # Passing the raw X coordinate
+    z_tolerance: float = 0.33, # ~4 inches vertically
+    x_tolerance: float = 0.50, # ~6 inches horizontally (x fluctuates more naturally)
+    k_search: int = 50 # Search depth
 ):
     """
-    Identifies the most mathematically similar historical pitch based on weighted Euclidean distance.
+    Identifies the most mathematically similar historical pitch that ALSO 
+    fits the pitcher's biomechanical arm slot constraints.
     """
-    # Ensure 2D shape, scale, and weight the target features
+    # 1. Prepare the target
     target_reshaped = np.array(target_features).reshape(1, -1)
     target_scaled = scaler.transform(target_reshaped)
     target_weighted = target_scaled * weights
     
-    distances, indices = nn_model.kneighbors(target_weighted)
+    # 2. Retrieve a wider pool of nearest neighbors (top K instead of top 2)
+    distances, indices = nn_model.kneighbors(target_weighted, n_neighbors=k_search)
     
-    # CRITICAL FIX: If distance to index 0 is ~0, the pitch is already in the dataset. 
-    # If the distance > 0, it's a new pitch, and index 0 is the actual clone.
-    if distances[0][0] < 1e-6:
-        clone_idx = indices[0][1]
-        clone_dist = distances[0][1]
-    else:
-        clone_idx = indices[0][0]
-        clone_dist = distances[0][0]
+    # 3. Iterate through neighbors to find the first biomechanical match
+    for i in range(k_search):
+        idx = indices[0][i]
+        dist = distances[0][i]
         
-    clone_pitch = original_df.iloc[clone_idx]
+        # Skip self-match (if the pitch is already in the dataset)
+        if dist < 1e-6:
+            continue
+            
+        candidate_pitch = original_df.iloc[idx]
+        
+        # Calculate arm slot delta
+        z_diff = abs(candidate_pitch['release_pos_z'] - target_z)
+        x_diff = abs(candidate_pitch['release_pos_x'] - target_x)
+        
+        # If it matches the arm slot criteria, we found our true clone!
+        if z_diff <= z_tolerance and x_diff <= x_tolerance:
+            return candidate_pitch, dist
+
+    # 4. Fallback: If no pitch in the top 50 matches the slot, default to the closest non-self neighbor
+    logger.warning("No clone found within arm slot tolerance. Falling back to absolute nearest neighbor.")
+    fallback_idx = indices[0][1] if distances[0][0] < 1e-6 else indices[0][0]
+    fallback_dist = distances[0][1] if distances[0][0] < 1e-6 else distances[0][0]
     
-    return clone_pitch, clone_dist
+    return original_df.iloc[fallback_idx], fallback_dist
 
 def recommend_arsenal(
     target_features: np.ndarray,
+    target_dict: dict, # Pass the raw input dictionary to extract z and x
     nn_model: NearestNeighbors,
     scaler: StandardScaler,
     weights: np.ndarray,
@@ -145,13 +166,19 @@ def recommend_arsenal(
     pitch_type_col: str = "pitch_type"
 ) -> dict:
     """
-    Recommends a pitch arsenal based on the nearest historical pitch clone.
+    Recommends a pitch arsenal based on the nearest historical pitch clone,
+    constrained by arm slot.
     """
-    logger.info("Generating arsenal recommendation via 1-NN clone...")
+    logger.info("Generating biomechanically constrained arsenal recommendation...")
     
-    # Step 1: Find nearest neighbor (clone)
+    # Extract the raw release coordinates from the incoming pitch
+    target_z = target_dict.get('release_pos_z', 6.0) # Default to 6.0 if missing
+    target_x = target_dict.get('release_pos_x', 2.0)
+    
+    # Step 1: Find nearest neighbor (clone) with arm slot filtering
     clone_pitch, distance = get_historical_clone(
-        target_features, nn_model, scaler, weights, df
+        target_features, nn_model, scaler, weights, df, 
+        target_z=target_z, target_x=target_x
     )
     
     # Step 2: Identify the pitcher of the clone
@@ -178,8 +205,8 @@ def recommend_arsenal(
     if "pitch_group" in pitcher_df.columns:
         group_arsenal = pitcher_df["pitch_group"].value_counts(normalize=True).reset_index()
         group_arsenal.columns = ["pitch_group", "usage"]
-    
-    logger.info(f"Arsenal generated for pitcher {clone_pitcher_id}")
+        
+    logger.info(f"Arsenal generated matching arm slot for pitcher {clone_pitcher_id}")
     
     return {
         "clone_pitch": clone_pitch,
