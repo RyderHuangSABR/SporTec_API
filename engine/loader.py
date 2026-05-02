@@ -16,7 +16,7 @@ def load_atlas_data():
     """Pulls the master historical file and the player dictionary."""
     logger.info("Fetching Master Data and Dictionary...")
     
-    # 1. Fetch the master pitching data (pointing to the folder)
+    # 1. Fetch the master pitching data (Now points to the Atlas/ folder!)
     data_path = hf_hub_download(
         repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
         filename="Atlas/Atlas_Pitching.parquet", 
@@ -25,10 +25,12 @@ def load_atlas_data():
     )
     df_master = pd.read_parquet(data_path)
     
-    # 2. Fetch the player dictionary (CHECK: If this is also in the Atlas folder, add 'Atlas/' here too)
+    # 2. Fetch the player dictionary
+    # Make sure this filename perfectly matches where it is in Hugging Face!
+    # If it is also in the Atlas folder, change it to "Atlas/MLB_Player_Dictionary.parquet"
     dict_path = hf_hub_download(
         repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
-        filename="Atlas/MLB_Player_Dictionary.parquet", 
+        filename="MLB_Player_Dictionary.parquet", 
         repo_type="dataset",
         token=HF_TOKEN
     )
@@ -36,9 +38,8 @@ def load_atlas_data():
     
     return df_master, df_dict
 
-# 🚨 THIS MUST BE PRESENT OR main.py WILL FAIL
 def get_models_for_pitch(statcast_code: str):
-    """Retrieves and caches XGBoost models from Hugging Face."""
+    """Retrieves and caches XGBoost models from Hugging Face for a given pitch type."""
     global _MODEL_CACHE
     group_name = PITCH_GROUPS.get(statcast_code)
     
@@ -50,7 +51,6 @@ def get_models_for_pitch(statcast_code: str):
 
     logger.info(f"Loading models into cache for pitch group: {group_name}")
     try:
-        # Check if your models are also in a folder (e.g., "Models/Engine_A...")
         path_a = hf_hub_download(repo_id=MODEL_REPO, filename=f"Engine_A_Whiff_{group_name}.json", token=HF_TOKEN)
         path_b = hf_hub_download(repo_id=MODEL_REPO, filename=f"Engine_B_Contact_{group_name}.json", token=HF_TOKEN)
         
