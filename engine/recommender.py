@@ -49,7 +49,6 @@ def train_xgboost_model(df: pd.DataFrame, target_col: str = 'contact_damage') ->
     X = df[FEATURES].fillna(0)
     y = df[target_col].fillna(0)
     
-    # Fit the model solely on training data to prevent data leakage
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
     model = xgb.XGBRegressor(
@@ -77,6 +76,7 @@ def train_xgboost_model(df: pd.DataFrame, target_col: str = 'contact_damage') ->
 def prepare_distance_metrics(xgb_model: xgb.XGBRegressor, df: pd.DataFrame):
     """
     Extracts weights and fits the scaler. 
+    (Replaces the old KD-Tree approach for faster dynamic filtering)
     """
     logger.info("Preparing Scaler and XGBoost Weights for distance calculations...")
     
@@ -86,13 +86,13 @@ def prepare_distance_metrics(xgb_model: xgb.XGBRegressor, df: pd.DataFrame):
     X_raw = df[FEATURES].fillna(0).copy()
     
     scaler = StandardScaler()
-    scaler.fit(X_raw) 
+    scaler.fit(X_raw) # We only need to fit it, not transform the whole dataset yet
     
     logger.info("Metrics prepared successfully.")
     return scaler, normalized_weights
 
 def get_strict_biomechanical_clone(
-    target_df: pd.DataFrame, 
+    target_features: np.ndarray, 
     target_dict: dict,
     scaler: StandardScaler, 
     weights: np.ndarray, 
@@ -102,16 +102,10 @@ def get_strict_biomechanical_clone(
 ):
     """
     Forces an absolute arm slot match by pre-filtering the dataset before 
-    calculating the weighted Euclidean distance using cdist. Employs a 1-NN 
-    approach to discover hidden pitching gems based on pure physics.
+    calculating the weighted Euclidean distance using cdist.
     """
-    # FIX: Throw an error instead of guessing the arm slot. 
-    # If we don't know the release point, we cannot find a valid biomechanical clone.
-    if 'release_pos_z' not in target_dict or 'release_pos_x' not in target_dict:
-        raise ValueError("Missing 'release_pos_z' or 'release_pos_x' in target_dict. Cannot guess arm slot.")
-        
-    target_z = target_dict['release_pos_z']
-    target_x = target_dict['release_pos_x']
+    target_z = target_dict.get('release_pos_z', 6.0)
+    target_x = target_dict.get('release_pos_x', 2.0)
 
     # 1. The Strict Arm Slot Gate
     slot_df = original_df[
@@ -122,9 +116,9 @@ def get_strict_biomechanical_clone(
     if slot_df.empty:
         raise ValueError(f"No historical pitches found within {z_tolerance}ft Z and {x_tolerance}ft X.")
 
-    # 2. Prepare the target vector (FIX: Use DataFrame to guarantee feature alignment)
-    target_raw = target_df[FEATURES].fillna(0)
-    target_weighted = scaler.transform(target_raw) * weights
+    # 2. Prepare the target vector
+    target_reshaped = np.array(target_features).reshape(1, -1)
+    target_weighted = scaler.transform(target_reshaped) * weights
 
     # 3. Prepare the filtered candidate pool
     candidates_raw = slot_df[FEATURES].fillna(0)
@@ -133,12 +127,12 @@ def get_strict_biomechanical_clone(
     # 4. Vectorized Distance Calculation (Lightning Fast)
     distances = cdist(target_weighted, candidates_weighted, metric='euclidean')[0]
 
-    # 5. Sort and find the absolute best match (Embracing the 1-NN Anomalies)
+    # 5. Sort and find the best match
     sorted_indices = np.argsort(distances)
     best_idx_in_slot = sorted_indices[0]
     best_dist = distances[best_idx_in_slot]
 
-    # 6. Protect against self-matching (comparing a pitch to itself)
+    # 6. Protect against self-matching
     if best_dist < 1e-6 and len(sorted_indices) > 1:
         best_idx_in_slot = sorted_indices[1]
         best_dist = distances[best_idx_in_slot]
@@ -148,7 +142,7 @@ def get_strict_biomechanical_clone(
     return clone_pitch, best_dist
 
 def recommend_arsenal(
-    target_df: pd.DataFrame,
+    target_features: np.ndarray,
     target_dict: dict,
     scaler: StandardScaler,
     weights: np.ndarray,
@@ -164,7 +158,7 @@ def recommend_arsenal(
     # Try to find a clone. If the arm slot is too weird, catch the error cleanly.
     try:
         clone_pitch, distance = get_strict_biomechanical_clone(
-            target_df, target_dict, scaler, weights, df
+            target_features, target_dict, scaler, weights, df
         )
     except ValueError as e:
         logger.error(f"Arsenal Recommendation Failed: {e}")
