@@ -2,6 +2,7 @@
 import os
 import logging
 import xgboost as xgb
+import pandas as pd 
 from huggingface_hub import hf_hub_download
 from engine.features import PITCH_GROUPS
 
