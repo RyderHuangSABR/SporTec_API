@@ -4,6 +4,7 @@ import secrets
 import logging
 import duckdb
 import pandas as pd
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks
 from fastapi.security import APIKeyHeader
@@ -15,16 +16,66 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from engine.recommender import recommend_arsenal
+# Import your ML engine functions
+from engine.recommender import (
+    recommend_arsenal, 
+    preprocess_atlas_data, 
+    train_xgboost_model, 
+    prepare_distance_metrics
+)
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas_api")
 
+# --- LIFESPAN (THE ML BRIDGE) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    This runs exactly once when the server starts. 
+    It loads your brain into RAM so it's lightning-fast for API clients.
+    """
+    logger.info("Booting up Atlas OS Machine Learning Core...")
+    
+    try:
+        # 1. Load the historical Statcast dataset (Update path as needed)
+        # Assuming you have a local CSV of statcast data for the 1-NN search
+        logger.info("Loading Statcast dataset...")
+        raw_df = pd.read_csv("data/statcast_historical.csv") 
+        
+        # 2. Preprocess the data to engineer your kinematic features
+        logger.info("Preprocessing biomechanical data...")
+        clean_df = preprocess_atlas_data(raw_df)
+        
+        # 3. Load or Train your XGBoost Model 
+        # (If you download your HF model, load it here. For now, we train on boot)
+        logger.info("Initializing XGBoost weights...")
+        xgb_model = train_xgboost_model(clean_df, target_col='contact_damage')
+        
+        # 4. Extract Scaler and Normalized Weights
+        scaler, weights = prepare_distance_metrics(xgb_model, clean_df)
+        
+        # 5. Save everything to the app's global state
+        app.state.clean_df = clean_df
+        app.state.scaler = scaler
+        app.state.weights = weights
+        app.state.xgb_model = xgb_model
+        
+        logger.info("✅ Atlas OS Brain loaded securely into RAM.")
+        yield
+        
+    except Exception as e:
+        logger.error(f"Failed to load ML Brain on startup: {e}")
+        raise e
+        
+    finally:
+        logger.info("Shutting down Atlas OS...")
+
 # --- APP INIT ---
 app = FastAPI(
     title="Atlas Pitching Analytics API",
-    version="2.0.0"
+    version="2.0.0",
+    lifespan=lifespan # Connects the ML loader to the app
 )
 
 # --- RATE LIMITING ---
@@ -92,6 +143,13 @@ class TargetPitch(BaseModel):
     fastball_speed: float
     release_speed: float
     spin_axis: float
+    # Add these based on your preprocess_atlas_data needs
+    pfx_x: float 
+    pfx_z: float
+    plate_x: float
+    plate_z: float
+    effective_speed: float
+    pitch_type: str
 
 class APIKeyRequest(BaseModel):
     client_name: str
@@ -111,15 +169,14 @@ def log_application_telemetry(client_name: str, pitch_data: dict, recommendation
             pitch_data.get("release_speed", 0.0),
             pitch_data.get("p_throws", "U"),
             recommendation.get("recommended_pitch", "Error"),
-            recommendation.get("kinematic_distance", 999.9),
-            recommendation.get("apex_clone_mlbid", 0)
+            recommendation.get("distance", 999.9), # Fixed from kinematic_distance
+            recommendation.get("clone_pitch", {}).get("pitcher", 0) if recommendation.get("clone_pitch") is not None else 0
         ])
     except Exception as e:
         logger.error(f"Telemetry failed: {e}")
 
 # --- ROUTES ---
 
-# ✅ ROOT (fixes your looping issue)
 @app.get("/")
 async def root():
     return {
@@ -128,16 +185,15 @@ async def root():
         "docs": "/docs"
     }
 
-# ✅ HEALTH CHECK
 @app.get("/health")
 @limiter.limit("5/minute")
 async def health_check(request: Request):
     return {
         "status": "healthy",
-        "service": "Atlas API"
+        "service": "Atlas API",
+        "ml_loaded": hasattr(request.app.state, 'xgb_model')
     }
 
-# ✅ PREDICTION
 @app.post("/api/v1/predict")
 @limiter.limit("10/minute")
 async def predict_pitch(
@@ -149,27 +205,53 @@ async def predict_pitch(
     logger.info(f"Prediction request from: {client_name}")
 
     try:
-        df = pd.DataFrame([pitch.model_dump()])
-        result = recommend_arsenal(df)
+        # 1. Retrieve the ML State from the App
+        scaler = request.app.state.scaler
+        weights = request.app.state.weights
+        historical_df = request.app.state.clean_df
+        
+        # 2. Format the incoming request
+        target_dict = pitch.model_dump()
+        target_df = pd.DataFrame([target_dict])
+        
+        # 3. Preprocess target to create movement_ratio, total_break, etc.
+        target_df = preprocess_atlas_data(target_df)
 
+        # 4. Pass ALL required arguments to the engine (This fixes the crash)
+        result = recommend_arsenal(
+            target_df=target_df,
+            target_dict=target_dict,
+            scaler=scaler,
+            weights=weights,
+            df=historical_df
+        )
+
+        # 5. Clean pandas objects to JSON serializable formats
+        safe_result = {
+            "distance": float(result["distance"]) if result.get("distance") is not None else None,
+            "error": result.get("error"),
+            "clone_pitch": result.get("clone_pitch").to_dict() if result.get("clone_pitch") is not None else None,
+            "arsenal": result.get("arsenal").to_dict(orient="records") if not result.get("arsenal").empty else None,
+        }
+
+        # 6. Log telemetry in background
         background_tasks.add_task(
             log_application_telemetry,
             client_name,
-            pitch.model_dump(),
-            result
+            target_dict,
+            safe_result
         )
 
         return {
             "status": "success",
             "client_id": client_name,
-            "data": result
+            "data": safe_result
         }
 
     except Exception as e:
         logger.error(f"Prediction error: {e}")
-        raise HTTPException(status_code=500, detail="Prediction failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ ADMIN KEY GENERATION
 @app.post("/admin/generate_key")
 async def generate_api_key(req: APIKeyRequest):
     expected_password = os.getenv("ATLAS_ADMIN_SECRET")
