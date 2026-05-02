@@ -3,69 +3,60 @@ import os
 import secrets
 import logging
 import duckdb
+import numpy as np
 import pandas as pd
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
-
 from pydantic import BaseModel
-
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sklearn.preprocessing import StandardScaler
 
-# Import your ML engine functions
-from engine.recommender import (
-    recommend_arsenal, 
-    preprocess_atlas_data, 
-    train_xgboost_model, 
-    prepare_distance_metrics
-)
+# --- IMPORT YOUR NEW ENGINE LOGIC ---
+from engine.loader import load_atlas_data, get_models_for_pitch
+from engine.recommender import recommend_arsenal, preprocess_atlas_data
+from engine.features import FEATURES  # Needed to align the XGBoost weights
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas_api")
 
-# --- LIFESPAN (THE ML BRIDGE) ---
+# --- LIFESPAN (THE CLOUD ML BRIDGE) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    This runs exactly once when the server starts. 
-    It loads your brain into RAM so it's lightning-fast for API clients.
+    Downloads Master Data from Hugging Face and initializes the Scaler globally.
+    Models are dynamically cached during runtime via loader.py.
     """
-    logger.info("Booting up Atlas OS Machine Learning Core...")
+    logger.info("Booting up Atlas OS Cloud ML Core...")
     
     try:
-        # 1. Load the historical Statcast dataset (Update path as needed)
-        # Assuming you have a local CSV of statcast data for the 1-NN search
-        logger.info("Loading Statcast dataset...")
-        raw_df = pd.read_csv("data/statcast_historical.csv") 
+        # 1. Fetch Parquets from Hugging Face via loader.py
+        df_master, df_dict = load_atlas_data()
         
-        # 2. Preprocess the data to engineer your kinematic features
-        logger.info("Preprocessing biomechanical data...")
-        clean_df = preprocess_atlas_data(raw_df)
+        # 2. Preprocess data to engineer kinematic features
+        logger.info("Preprocessing Master Biomechanical Dataset...")
+        clean_df = preprocess_atlas_data(df_master)
         
-        # 3. Load or Train your XGBoost Model 
-        # (If you download your HF model, load it here. For now, we train on boot)
-        logger.info("Initializing XGBoost weights...")
-        xgb_model = train_xgboost_model(clean_df, target_col='contact_damage')
+        # 3. Fit the Universal Scaler
+        logger.info("Fitting standard scaler for 1-NN Euclidean calculations...")
+        scaler = StandardScaler()
+        scaler.fit(clean_df[FEATURES].fillna(0))
         
-        # 4. Extract Scaler and Normalized Weights
-        scaler, weights = prepare_distance_metrics(xgb_model, clean_df)
-        
-        # 5. Save everything to the app's global state
+        # 4. Save to global state
         app.state.clean_df = clean_df
+        app.state.df_dict = df_dict
         app.state.scaler = scaler
-        app.state.weights = weights
-        app.state.xgb_model = xgb_model
         
-        logger.info("✅ Atlas OS Brain loaded securely into RAM.")
+        logger.info("✅ Atlas OS Cloud Brain loaded into RAM.")
         yield
         
     except Exception as e:
-        logger.error(f"Failed to load ML Brain on startup: {e}")
+        logger.error(f"Failed to load ML Brain from Hugging Face: {e}")
         raise e
         
     finally:
@@ -74,8 +65,8 @@ async def lifespan(app: FastAPI):
 # --- APP INIT ---
 app = FastAPI(
     title="Atlas Pitching Analytics API",
-    version="2.0.0",
-    lifespan=lifespan # Connects the ML loader to the app
+    version="3.0.0",
+    lifespan=lifespan 
 )
 
 # --- RATE LIMITING ---
@@ -143,7 +134,6 @@ class TargetPitch(BaseModel):
     fastball_speed: float
     release_speed: float
     spin_axis: float
-    # Add these based on your preprocess_atlas_data needs
     pfx_x: float 
     pfx_z: float
     plate_x: float
@@ -169,7 +159,7 @@ def log_application_telemetry(client_name: str, pitch_data: dict, recommendation
             pitch_data.get("release_speed", 0.0),
             pitch_data.get("p_throws", "U"),
             recommendation.get("recommended_pitch", "Error"),
-            recommendation.get("distance", 999.9), # Fixed from kinematic_distance
+            recommendation.get("distance", 999.9), 
             recommendation.get("clone_pitch", {}).get("pitcher", 0) if recommendation.get("clone_pitch") is not None else 0
         ])
     except Exception as e:
@@ -182,7 +172,7 @@ async def root():
     return {
         "status": "ok",
         "service": "Atlas API",
-        "docs": "/docs"
+        "data_source": "Hugging Face"
     }
 
 @app.get("/health")
@@ -191,7 +181,7 @@ async def health_check(request: Request):
     return {
         "status": "healthy",
         "service": "Atlas API",
-        "ml_loaded": hasattr(request.app.state, 'xgb_model')
+        "hf_data_loaded": hasattr(request.app.state, 'clean_df')
     }
 
 @app.post("/api/v1/predict")
@@ -205,28 +195,41 @@ async def predict_pitch(
     logger.info(f"Prediction request from: {client_name}")
 
     try:
-        # 1. Retrieve the ML State from the App
+        # 1. Retrieve Global ML State
         scaler = request.app.state.scaler
-        weights = request.app.state.weights
         historical_df = request.app.state.clean_df
         
-        # 2. Format the incoming request
+        # 2. Format request and Preprocess
         target_dict = pitch.model_dump()
         target_df = pd.DataFrame([target_dict])
-        
-        # 3. Preprocess target to create movement_ratio, total_break, etc.
         target_df = preprocess_atlas_data(target_df)
 
-        # 4. Pass ALL required arguments to the engine (This fixes the crash)
+        # 3. Pull Pre-Trained XGBoost Models from Hugging Face Cache
+        target_pitch_type = target_dict.get("pitch_type", "FF")
+        models = get_models_for_pitch(target_pitch_type)
+        
+        if not models:
+            raise HTTPException(status_code=400, detail=f"No models deployed for pitch type: {target_pitch_type}")
+
+        # 4. Extract Weights from Engine B (Contact Damage Booster)
+        booster_b = models["B"]
+        # .get_score() extracts feature importance from native boosters
+        scores = booster_b.get_score(importance_type='gain') 
+        
+        # Map scores to the feature array safely (defaulting to tiny non-zero weight if missing)
+        raw_weights = np.array([scores.get(feat, 1e-4) for feat in FEATURES])
+        normalized_weights = raw_weights / np.sum(raw_weights)
+
+        # 5. Run the Recommender Pipeline
         result = recommend_arsenal(
             target_df=target_df,
             target_dict=target_dict,
             scaler=scaler,
-            weights=weights,
+            weights=normalized_weights,
             df=historical_df
         )
 
-        # 5. Clean pandas objects to JSON serializable formats
+        # 6. JSON Serialization
         safe_result = {
             "distance": float(result["distance"]) if result.get("distance") is not None else None,
             "error": result.get("error"),
@@ -234,7 +237,7 @@ async def predict_pitch(
             "arsenal": result.get("arsenal").to_dict(orient="records") if not result.get("arsenal").empty else None,
         }
 
-        # 6. Log telemetry in background
+        # 7. Telemetry Fire-and-Forget
         background_tasks.add_task(
             log_application_telemetry,
             client_name,
