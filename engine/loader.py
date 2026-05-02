@@ -16,22 +16,19 @@ def load_atlas_data():
     """Pulls the master historical file and the player dictionary."""
     logger.info("Fetching Master Data and Dictionary...")
     
-    # 1. Fetch the master pitching data
-    # 🚨 FIX: Changed filename to include the "Atlas/" folder path
+    # 1. Fetch the master pitching data (pointing to the folder)
     data_path = hf_hub_download(
         repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
-        filename="Atlas/Atlas_Pitching.parquet", # Added the folder path here
+        filename="Atlas/Atlas_Pitching.parquet", 
         repo_type="dataset",
         token=HF_TOKEN
     )
     df_master = pd.read_parquet(data_path)
     
-    # 2. Fetch the player dictionary
-    # 🚨 NOTE: Check if this file is also in a folder! 
-    # If it is in the same folder, change it to "Atlas/MLB_Player_Dictionary.parquet"
+    # 2. Fetch the player dictionary (CHECK: If this is also in the Atlas folder, add 'Atlas/' here too)
     dict_path = hf_hub_download(
         repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
-        filename="MLB_Player_Dictionary.parquet", 
+        filename="Atlas/MLB_Player_Dictionary.parquet", 
         repo_type="dataset",
         token=HF_TOKEN
     )
@@ -39,4 +36,31 @@ def load_atlas_data():
     
     return df_master, df_dict
 
-# ... rest of your get_models_for_pitch function remains the same
+# 🚨 THIS MUST BE PRESENT OR main.py WILL FAIL
+def get_models_for_pitch(statcast_code: str):
+    """Retrieves and caches XGBoost models from Hugging Face."""
+    global _MODEL_CACHE
+    group_name = PITCH_GROUPS.get(statcast_code)
+    
+    if not group_name: 
+        return None
+
+    if group_name in _MODEL_CACHE:
+        return _MODEL_CACHE[group_name]
+
+    logger.info(f"Loading models into cache for pitch group: {group_name}")
+    try:
+        # Check if your models are also in a folder (e.g., "Models/Engine_A...")
+        path_a = hf_hub_download(repo_id=MODEL_REPO, filename=f"Engine_A_Whiff_{group_name}.json", token=HF_TOKEN)
+        path_b = hf_hub_download(repo_id=MODEL_REPO, filename=f"Engine_B_Contact_{group_name}.json", token=HF_TOKEN)
+        
+        model_a, model_b = xgb.Booster(), xgb.Booster()
+        model_a.load_model(path_a)
+        model_b.load_model(path_b)
+        
+        _MODEL_CACHE[group_name] = {"A": model_a, "B": model_b}
+        return _MODEL_CACHE[group_name]
+    
+    except Exception as e:
+        logger.error(f"Failed to load models for {group_name}: {e}")
+        return None
