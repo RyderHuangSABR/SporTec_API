@@ -172,7 +172,7 @@ async def predict_pitch(
 # ✅ ADMIN KEY GENERATION
 @app.post("/admin/generate_key")
 async def generate_api_key(req: APIKeyRequest):
-    expected_password = os.getenv("ATLAS_ADMIN_SECRET")
+    expected_password = os.getenv("API_KEY")
 
     if not expected_password or req.admin_password != expected_password:
         raise HTTPException(status_code=403, detail="Forbidden")
