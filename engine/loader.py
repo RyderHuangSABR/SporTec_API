@@ -4,6 +4,7 @@ import logging
 import xgboost as xgb
 from huggingface_hub import hf_hub_download
 from engine.features import PITCH_GROUPS
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 HF_TOKEN = os.getenv("HF_TOKEN")
