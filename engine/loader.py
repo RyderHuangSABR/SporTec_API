@@ -2,7 +2,6 @@
 import os
 import logging
 import xgboost as xgb
-import pandas as pd
 from huggingface_hub import hf_hub_download
 from engine.features import PITCH_GROUPS
 
@@ -16,18 +15,16 @@ def load_atlas_data():
     """Pulls the master historical file and the player dictionary."""
     logger.info("Fetching Master Data and Dictionary...")
     
-    # 1. Fetch the master pitching data (Now points to the Atlas/ folder!)
+    # 1. Fetch the master pitching data
     data_path = hf_hub_download(
         repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
         filename="Atlas/Atlas_Pitching.parquet", 
-        repo_type="dataset",
+        repo_type="dataset", # Specify it's a dataset repo
         token=HF_TOKEN
     )
     df_master = pd.read_parquet(data_path)
     
     # 2. Fetch the player dictionary
-    # Make sure this filename perfectly matches where it is in Hugging Face!
-    # If it is also in the Atlas folder, change it to "Atlas/MLB_Player_Dictionary.parquet"
     dict_path = hf_hub_download(
         repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
         filename="MLB_Player_Dictionary.parquet", 
