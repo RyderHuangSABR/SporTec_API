@@ -47,6 +47,9 @@ def preprocess_atlas_data(df: pd.DataFrame) -> pd.DataFrame:
     clean_cols = ['pfx_x', 'pfx_z', 'plate_x', 'plate_z', 'release_speed', 'effective_speed']
     df = df.dropna(subset=clean_cols).copy()
     
+    if df.empty:
+        return df
+
     df['pitch_group'] = df['pitch_type'].map(PITCH_GROUPS).fillna('Unknown')
     
     df['total_break'] = np.sqrt(df['pfx_x']**2 + df['pfx_z']**2)
@@ -91,13 +94,19 @@ def get_strict_biomechanical_clone(
     if slot_df.empty:
         raise ValueError(f"No historical pitches found within {z_tolerance}ft Z and {x_tolerance}ft X.")
 
+    # Run preprocessing on the historical pitches so they have 'movement_ratio', etc.
+    slot_df = preprocess_atlas_data(slot_df)
+
     # 2. Fit Scaler dynamically on the filtered subset
     scaler = StandardScaler()
     
-    # Ensure all target features exist in the target_df (fill missing with 0 for safety)
+    # 🚨 IRONCLAD FIX: Ensure all target features exist in BOTH dataframes.
+    # If a column is missing, fill it with 0.0 to mathematically prevent Pandas KeyErrors.
     for col in FEATURES:
         if col not in target_df.columns:
             target_df[col] = 0.0
+        if col not in slot_df.columns:
+            slot_df[col] = 0.0
 
     target_raw = target_df[FEATURES].fillna(0)
     candidates_raw = slot_df[FEATURES].fillna(0)
@@ -136,8 +145,7 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
         logger.error(f"Arsenal Recommendation Failed: {e}")
         return {
             "error": str(e),
-            "clone_pitch": None,
-            "distance": None,
+            "clone_pitcher_id": None,
             "arsenal": [],
             "group_arsenal": []
         }
@@ -161,8 +169,7 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
         con.close()
     
     if pitcher_df.empty:
-        clean_clone = clone_pitch.replace({np.nan: None}).to_dict()
-        return {"clone_pitch": clean_clone, "distance": float(distance), "arsenal": [], "group_arsenal": []}
+        return {"clone_pitcher_id": int(clone_pitcher_id), "arsenal": [], "group_arsenal": []}
     
     # Calculate Arsenal Usages
     arsenal = pitcher_df[pitch_type_col].value_counts(normalize=True).reset_index()
@@ -175,12 +182,9 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
         
     logger.info(f"Arsenal generated matching arm slot for pitcher {clone_pitcher_id}")
     
-    # Clean up NumPy types for JSON serialization
-    clean_clone = clone_pitch.replace({np.nan: None}).to_dict()
-    
+    # Returning EXACTLY what you asked for: Pitcher ID and Arsenals
     return {
-        "clone_pitch": clean_clone,
-        "distance": float(distance),
+        "clone_pitcher_id": int(clone_pitcher_id),
         "arsenal": arsenal.to_dict(orient="records"),
         "group_arsenal": group_arsenal.to_dict(orient="records") if group_arsenal is not None else []
     }
