@@ -4,27 +4,54 @@ import secrets
 import logging
 import duckdb
 import pandas as pd
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
-
 from pydantic import BaseModel
-
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sklearn.preprocessing import StandardScaler
 
 from engine.recommender import recommend_arsenal
+from engine.loader import load_atlas_data
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas_api")
 
+# --- LIFESPAN (Runs once when server starts) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 Starting up: Downloading Hugging Face data...")
+    try:
+        # 1. Download the data using your loader
+        df_master, df_dict = load_atlas_data()
+        
+        # 2. Store it in app.state so the whole app can access it in RAM
+        app.state.df = df_master
+        app.state.target_dict = df_dict
+        
+        # 3. Create your Scaler and Weights
+        app.state.scaler = StandardScaler() 
+        # (If your scaler needs fitting, you'd do it here like: app.state.scaler.fit(df_master[['col1', 'col2']]))
+        app.state.weights = [1.0, 1.0, 1.0, 1.0, 1.0] # Replace with your actual weights
+        
+        logger.info("✅ ML Brain loaded into RAM! Opening for traffic...")
+    except Exception as e:
+        logger.error(f"❌ Failed to load ML assets: {e}")
+        
+    yield
+    
+    logger.info("🛑 Shutting down server...")
+
 # --- APP INIT ---
 app = FastAPI(
     title="Atlas Pitching Analytics API",
-    version="2.0.0"
+    version="2.0.0",
+    lifespan=lifespan  # 🚨 Added the lifespan here!
 )
 
 # --- RATE LIMITING ---
@@ -70,11 +97,11 @@ db = init_db()
 # --- SECURITY ---
 api_key_header = APIKeyHeader(name="X-API-Key")
 
-# 🚨 ADD THIS: Pull your Master Key from Render's Environment Vault
+# Pull your Master Key from Render's Environment Vault
 MASTER_KEY = os.getenv("API_KEY", "6YHN4RFV3edc@")
 
 def authenticate_client(api_key: str = Security(api_key_header)):
-    # 🚨 ADD THIS: Master Key Override (Survives Render Restarts!)
+    # Master Key Override (Survives Render Restarts!)
     if api_key == MASTER_KEY:
         return "Atlas Admin"
 
@@ -127,7 +154,6 @@ def log_application_telemetry(client_name: str, pitch_data: dict, recommendation
 
 # --- ROUTES ---
 
-# ✅ ROOT (fixes your looping issue)
 @app.get("/")
 async def root():
     return {
@@ -136,7 +162,6 @@ async def root():
         "docs": "/docs"
     }
 
-# ✅ HEALTH CHECK
 @app.get("/health")
 @limiter.limit("5/minute")
 async def health_check(request: Request):
@@ -145,7 +170,6 @@ async def health_check(request: Request):
         "service": "Atlas API"
     }
 
-# ✅ PREDICTION
 @app.post("/api/v1/predict")
 @limiter.limit("10/minute")
 async def predict_pitch(
@@ -157,8 +181,16 @@ async def predict_pitch(
     logger.info(f"Prediction request from: {client_name}")
 
     try:
-        df = pd.DataFrame([pitch.model_dump()])
-        result = recommend_arsenal(df)
+        df_input = pd.DataFrame([pitch.model_dump()])
+        
+        # 🚨 FIX: Pass ALL 5 required parameters from the app state
+        result = recommend_arsenal(
+            target_features=df_input,
+            target_dict=request.app.state.target_dict,
+            scaler=request.app.state.scaler,
+            weights=request.app.state.weights,
+            df=request.app.state.df
+        )
 
         background_tasks.add_task(
             log_application_telemetry,
@@ -177,7 +209,6 @@ async def predict_pitch(
         logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail="Prediction failed")
 
-# ✅ ADMIN KEY GENERATION
 @app.post("/admin/generate_key")
 async def generate_api_key(req: APIKeyRequest):
     expected_password = os.getenv("API_KEY")
