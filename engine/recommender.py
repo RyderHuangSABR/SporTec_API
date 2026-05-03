@@ -14,14 +14,11 @@ from engine.features import FEATURES, PITCH_GROUPS
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# FILE MANAGEMENT
+# FILE MANAGEMENT & DB CONNECTION
 # ==========================================
 
 def get_parquet_path() -> str:
-    """
-    Safely gets the path to the Parquet file on disk without loading it into RAM.
-    If it isn't downloaded yet, huggingface_hub will download it. If it is, it just returns the path.
-    """
+    """Safely gets the path to the Parquet file on disk."""
     token = os.getenv("HF_TOKEN")
     return hf_hub_download(
         repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
@@ -29,6 +26,17 @@ def get_parquet_path() -> str:
         repo_type="dataset", 
         token=token
     )
+
+def get_duckdb_conn():
+    """
+    Creates a strictly memory-leashed DuckDB connection.
+    This prevents DuckDB from spiking RAM and getting OOM-killed by Render.
+    """
+    con = duckdb.connect()
+    # STRICT LEASH: Limit to 256MB RAM and 1 CPU thread
+    con.execute("PRAGMA memory_limit='256MB'")
+    con.execute("PRAGMA threads=1")
+    return con
 
 # ==========================================
 # BIOMECHANICAL PRE-PROCESSING
@@ -60,21 +68,24 @@ def get_strict_biomechanical_clone(
 ):
     """
     Forces an absolute arm slot match by using DuckDB to pre-filter the dataset 
-    DIRECTLY FROM DISK before calculating distance. Zero RAM overload.
+    DIRECTLY FROM DISK with a strict memory limit.
     """
     target_z = float(target_df['release_pos_z'].iloc[0])
     target_x = float(target_df['release_pos_x'].iloc[0])
 
     parquet_file = get_parquet_path()
+    con = get_duckdb_conn()
 
-    # 1. The Strict Arm Slot Gate (DuckDB Magic)
-    # We query the file on disk. This uses almost zero RAM.
+    # 1. The Strict Arm Slot Gate (Leashed DuckDB Magic)
     query = f"""
         SELECT * FROM '{parquet_file}'
         WHERE release_pos_z BETWEEN {target_z - z_tolerance} AND {target_z + z_tolerance}
           AND release_pos_x BETWEEN {target_x - x_tolerance} AND {target_x + x_tolerance}
     """
-    slot_df = duckdb.query(query).df()
+    try:
+        slot_df = con.query(query).df()
+    finally:
+        con.close() # Always close the connection to free memory
 
     if slot_df.empty:
         raise ValueError(f"No historical pitches found within {z_tolerance}ft Z and {x_tolerance}ft X.")
@@ -92,7 +103,7 @@ def get_strict_biomechanical_clone(
     
     scaler.fit(candidates_raw)
 
-    # 3. Apply weights (Uniform weights for now since XGBoost isn't loaded globally)
+    # 3. Apply weights (Uniform weights for now)
     weights = np.ones(len(FEATURES))
     
     target_weighted = scaler.transform(target_raw) * weights
@@ -115,10 +126,7 @@ def get_strict_biomechanical_clone(
 # ==========================================
 
 def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", pitch_type_col: str = "pitch_type") -> dict:
-    """
-    Recommends a pitch arsenal based on the strict biomechanical clone.
-    Expects ONLY the 1-row target DataFrame. Handles all external data internally.
-    """
+    """Recommends a pitch arsenal based on the strict biomechanical clone."""
     logger.info("Generating strictly constrained arsenal recommendation...")
     
     try:
@@ -135,21 +143,23 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
     
     clone_pitcher_id = clone_pitch[pitcher_id_col]
     parquet_file = get_parquet_path()
+    con = get_duckdb_conn()
     
-    # Use DuckDB again to grab JUST this specific pitcher's arsenal from disk
+    # Use Leashed DuckDB again
     arsenal_query = f"""
         SELECT {pitch_type_col}, pitch_group 
         FROM '{parquet_file}' 
         WHERE {pitcher_id_col} = {clone_pitcher_id}
     """
     try:
-        pitcher_df = duckdb.query(arsenal_query).df()
+        pitcher_df = con.query(arsenal_query).df()
     except Exception as e:
         logger.warning(f"Failed to query pitch arsenal for {clone_pitcher_id}: {e}")
         pitcher_df = pd.DataFrame()
+    finally:
+        con.close()
     
     if pitcher_df.empty:
-        # Convert clone_pitch series to dict and handle numpy types for JSON serialization
         clean_clone = clone_pitch.replace({np.nan: None}).to_dict()
         return {"clone_pitch": clean_clone, "distance": float(distance), "arsenal": [], "group_arsenal": []}
     
