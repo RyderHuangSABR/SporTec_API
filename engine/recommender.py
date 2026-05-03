@@ -76,11 +76,12 @@ def get_strict_biomechanical_clone(
     parquet_file = get_parquet_path()
     con = get_duckdb_conn()
 
-    # 1. The Strict Arm Slot Gate (Leashed DuckDB Magic)
+    # 1. The Strict Arm Slot Gate (Leashed DuckDB Magic + RAM Safe Limit)
     query = f"""
         SELECT * FROM '{parquet_file}'
         WHERE release_pos_z BETWEEN {target_z - z_tolerance} AND {target_z + z_tolerance}
           AND release_pos_x BETWEEN {target_x - x_tolerance} AND {target_x + x_tolerance}
+        LIMIT 5000
     """
     try:
         slot_df = con.query(query).df()
