@@ -70,7 +70,15 @@ db = init_db()
 # --- SECURITY ---
 api_key_header = APIKeyHeader(name="X-API-Key")
 
+# 🚨 ADD THIS: Pull your Master Key from Render's Environment Vault
+MASTER_KEY = os.getenv("API_KEY", "6YHN4RFV3edc@")
+
 def authenticate_client(api_key: str = Security(api_key_header)):
+    # 🚨 ADD THIS: Master Key Override (Survives Render Restarts!)
+    if api_key == MASTER_KEY:
+        return "Atlas Admin"
+
+    # Client Key Check (Looks in DuckDB for generated keys)
     result = db.execute(
         "SELECT client_name FROM api_clients WHERE api_key = ?",
         [api_key]
