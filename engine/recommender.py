@@ -98,7 +98,6 @@ def get_strict_biomechanical_clone(
         if col not in slot_df.columns:
             slot_df[col] = 0.0
 
-    # Force all features to be strict numbers.
     target_raw = target_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
     candidates_raw = slot_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
     
@@ -133,56 +132,18 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
         logger.error(f"Arsenal Recommendation Failed: {e}")
         return {
             "error": str(e),
-            "clone_pitch": None,
+            "clone_pitch": {"pitcher_id": None},
             "distance": None,
             "arsenal": [],
             "group_arsenal": []
         }
     
-    # Safely extract Pitcher ID
-    try:
-        clone_pitcher_id = int(clone_pitch[pitcher_id_col])
-    except:
-        clone_pitcher_id = 0
-
-    parquet_file = get_parquet_path()
-    con = get_duckdb_conn()
-    
-    arsenal_query = f"""
-        SELECT {pitch_type_col}, pitch_group 
-        FROM '{parquet_file}' 
-        WHERE {pitcher_id_col} = {clone_pitcher_id}
-    """
-    try:
-        pitcher_df = con.query(arsenal_query).df()
-    except Exception as e:
-        logger.warning(f"Failed to query pitch arsenal for {clone_pitcher_id}: {e}")
-        pitcher_df = pd.DataFrame()
-    finally:
-        con.close()
-    
-    # Calculate Arsenal Usages
-    if not pitcher_df.empty:
-        arsenal = pitcher_df[pitch_type_col].value_counts(normalize=True).reset_index()
-        arsenal.columns = ["pitch_type", "usage"]
-        arsenal_data = arsenal.to_dict(orient="records")
+    # 🚨 FIX 1: Safely extract Pitcher ID (handles floats, strings, and missing data)
+    raw_id = clone_pitch.get(pitcher_id_col)
+    if pd.isna(raw_id) and 'pitcher_id' in clone_pitch:
+        raw_id = clone_pitch.get('pitcher_id')
         
-        group_arsenal_data = []
-        if "pitch_group" in pitcher_df.columns:
-            group_arsenal = pitcher_df["pitch_group"].value_counts(normalize=True).reset_index()
-            group_arsenal.columns = ["pitch_group", "usage"]
-            group_arsenal_data = group_arsenal.to_dict(orient="records")
-    else:
-        arsenal_data = []
-        group_arsenal_data = []
-        
-    logger.info(f"Arsenal generated matching arm slot for pitcher {clone_pitcher_id}")
-    
-    # THE TRICK: We keep the schema intact, but strip out the heavy data. 
-    # clone_pitch is now just a tiny dictionary with the ID. Distance is null.
-    return {
-        "clone_pitch": {"pitcher_id": clone_pitcher_id}, 
-        "distance": None,
-        "arsenal": arsenal_data,
-        "group_arsenal": group_arsenal_data
-    }
+    try:
+        clone_pitcher_id = int(float(raw_id))
+    except (ValueError, TypeError):
+        return
