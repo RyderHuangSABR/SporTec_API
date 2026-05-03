@@ -100,16 +100,16 @@ def get_strict_biomechanical_clone(
     # 2. Fit Scaler dynamically on the filtered subset
     scaler = StandardScaler()
     
-    # 🚨 IRONCLAD FIX: Ensure all target features exist in BOTH dataframes.
-    # If a column is missing, fill it with 0.0 to mathematically prevent Pandas KeyErrors.
+    # Ensure all target features exist in BOTH dataframes.
     for col in FEATURES:
         if col not in target_df.columns:
             target_df[col] = 0.0
         if col not in slot_df.columns:
             slot_df[col] = 0.0
 
-    target_raw = target_df[FEATURES].fillna(0)
-    candidates_raw = slot_df[FEATURES].fillna(0)
+    # 🚨 THE FIX: Force all features to be strict numbers. Turn 'FC' into NaN, then fill with 0.
+    target_raw = target_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
+    candidates_raw = slot_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
     
     scaler.fit(candidates_raw)
 
@@ -182,7 +182,6 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
         
     logger.info(f"Arsenal generated matching arm slot for pitcher {clone_pitcher_id}")
     
-    # Returning EXACTLY what you asked for: Pitcher ID and Arsenals
     return {
         "clone_pitcher_id": int(clone_pitcher_id),
         "arsenal": arsenal.to_dict(orient="records"),
