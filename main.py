@@ -1,3 +1,4 @@
+# main.py
 import os
 import secrets
 import logging
@@ -19,30 +20,27 @@ from engine.recommender import recommend_arsenal
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas_api")
 
-# --- LIFESPAN: SIMPLIFIED ---
+# --- LIFESPAN: INSTANT BOOT ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # We no longer need to download the Parquet file! 
-    # Just ensure the GMM CSV is in the /atlas folder.
-    logger.info("🚀 Atlas API Starting Up...")
-    if not os.path.exists("Atlas/gmm_pitch_profiles.csv"):
-        logger.error("❌ CRITICAL: gmm_pitch_profiles.csv not found in /atlas directory!")
-    else:
-        logger.info("✅ GMM Profiles found. Ready for deployment.")
+    # We deleted the Hugging Face download! 
+    # It just boots instantly using the local CSV now.
+    logger.info("🚀 Starting up: Atlas API loading local GMM profiles...")
     yield
 
 # --- APP INIT ---
 app = FastAPI(
     title="Atlas Pitching Analytics API",
-    version="2.1.0",
-    lifespan=lifespan
+    version="2.0.0",
+    lifespan=lifespan 
 )
 
-# --- RATE LIMITING & CORS (Keep these as they were) ---
+# --- RATE LIMITING ---
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,7 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATABASE INIT (Telemetry stays local) ---
+# --- DATABASE INIT ---
 def init_db():
     db = duckdb.connect("atlas_application.db")
     db.execute("""
@@ -65,10 +63,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS telemetry_logs (
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             client_name TEXT,
+            input_vaa DOUBLE,
             input_speed DOUBLE,
-            recommended_pitch_type TEXT,
+            input_p_throws TEXT,
+            recommended_pitch TEXT,
             kinematic_distance DOUBLE,
-            matched_mlbid INTEGER
+            apex_clone_mlbid INTEGER
         );
     """)
     return db
@@ -77,40 +77,58 @@ db = init_db()
 
 # --- SECURITY ---
 api_key_header = APIKeyHeader(name="X-API-Key")
+
+# Pull Master Key from Render Environment
 MASTER_KEY = os.getenv("API_KEY", "6YHN4RFV3edc@")
 
 def authenticate_client(api_key: str = Security(api_key_header)):
     if api_key == MASTER_KEY:
         return "Atlas Admin"
-    result = db.execute("SELECT client_name FROM api_clients WHERE api_key = ?", [api_key]).fetchone()
+
+    result = db.execute(
+        "SELECT client_name FROM api_clients WHERE api_key = ?",
+        [api_key]
+    ).fetchone()
+
     if not result:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     return result[0]
 
 # --- MODELS ---
 class TargetPitch(BaseModel):
-    # The fields your frontend sends
-    release_speed: float
-    pfx_x: float
-    pfx_z: float
-    release_pos_x: float
-    release_pos_z: float
+    p_throws: str
+    vaa: float
+    haa: float
     release_extension: float
+    release_pos_z: float
+    release_pos_x: float
+    fastball_speed: float
+    release_speed: float
+    spin_axis: float
+
+class APIKeyRequest(BaseModel):
+    client_name: str
+    tier: str
+    admin_password: str
 
 # --- TELEMETRY ---
-def log_application_telemetry(client_name: str, pitch_data: dict, result: dict):
+def log_application_telemetry(client_name: str, pitch_data: dict, recommendation: dict):
     try:
-        # Adjusted to match the new GMM return structure
-        identity = result.get("identity", {})
+        # Extracting from the new GMM dictionary structure safely
+        identity = recommendation.get("identity") or {}
+        
         db.execute("""
             INSERT INTO telemetry_logs 
-            (client_name, input_speed, recommended_pitch_type, kinematic_distance, matched_mlbid)
-            VALUES (?, ?, ?, ?, ?)
+            (client_name, input_vaa, input_speed, input_p_throws, recommended_pitch, kinematic_distance, apex_clone_mlbid)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, [
             client_name,
+            pitch_data.get("vaa", 0.0),
             pitch_data.get("release_speed", 0.0),
-            identity.get("matched_pitch_type", "Unknown"),
-            result.get("distance", 0.0),
+            pitch_data.get("p_throws", "U"),
+            identity.get("matched_pitch_type", "Error"),
+            recommendation.get("distance", 999.9),
             identity.get("matched_pitcher_id", 0)
         ])
     except Exception as e:
@@ -120,20 +138,33 @@ def log_application_telemetry(client_name: str, pitch_data: dict, result: dict):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "engine": "GMM-Centroid-v2"}
+    return {
+        "status": "ok",
+        "service": "Atlas API",
+        "docs": "/docs"
+    }
+
+@app.get("/health")
+@limiter.limit("5/minute")
+async def health_check(request: Request):
+    return {
+        "status": "healthy",
+        "service": "Atlas API"
+    }
 
 @app.post("/api/v1/predict")
-@limiter.limit("20/minute") # We can increase limit because it's faster now!
+@limiter.limit("10/minute")
 async def predict_pitch(
     request: Request,
     pitch: TargetPitch,
     background_tasks: BackgroundTasks,
     client_name: str = Security(authenticate_client)
 ):
+    logger.info(f"Prediction request from: {client_name}")
+
     try:
         df_input = pd.DataFrame([pitch.model_dump()])
         
-        # This calls your lightning-fast GMM engine
         result = recommend_arsenal(df_input)
 
         background_tasks.add_task(
@@ -145,6 +176,7 @@ async def predict_pitch(
 
         return {
             "status": "success",
+            "client_id": client_name,
             "data": result
         }
 
@@ -152,4 +184,27 @@ async def predict_pitch(
         logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail="Prediction failed")
 
-# (Keep admin routes as they were...)
+@app.post("/admin/generate_key")
+async def generate_api_key(req: APIKeyRequest):
+    expected_password = os.getenv("API_KEY")
+
+    if not expected_password or req.admin_password != expected_password:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    new_api_key = f"atl_{secrets.token_hex(16)}"
+
+    try:
+        db.execute(
+            "INSERT INTO api_clients (api_key, client_name, tier) VALUES (?, ?, ?)",
+            [new_api_key, req.client_name, req.tier]
+        )
+
+        return {
+            "status": "success",
+            "client_name": req.client_name,
+            "api_key": new_api_key
+        }
+
+    except Exception as e:
+        logger.error(f"Key generation error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
