@@ -30,7 +30,6 @@ def get_parquet_path() -> str:
 def get_duckdb_conn():
     """Creates a strictly memory-leashed DuckDB connection."""
     con = duckdb.connect()
-    # STRICT LEASH: Limit to 256MB RAM and 1 CPU thread
     con.execute("PRAGMA memory_limit='256MB'")
     con.execute("PRAGMA threads=1")
     return con
@@ -58,27 +57,41 @@ def preprocess_atlas_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==========================================
-# DUCKDB LOW-RAM DISTANCE METRICS
+# DUCKDB AVERAGE PROFILE METRICS
 # ==========================================
 
-def get_strict_biomechanical_clone(
+def get_average_pitch_profile_clone(
     target_df: pd.DataFrame, 
-    z_tolerance: float = 0.25,
-    x_tolerance: float = 0.33
+    z_tolerance: float = 0.5,
+    x_tolerance: float = 0.5
 ):
-    """Forces an absolute arm slot match natively from disk."""
+    """Calculates average pitcher profiles natively in DuckDB and finds the closest match."""
     target_z = float(target_df['release_pos_z'].iloc[0])
     target_x = float(target_df['release_pos_x'].iloc[0])
 
     parquet_file = get_parquet_path()
     con = get_duckdb_conn()
 
-    # 1. The Strict Arm Slot Gate (Leashed DuckDB Magic + RAM Safe Limit)
+    # 🚨 THE MAGIC: We group by MLBID and Pitch Type, taking the AVERAGE of all physics!
     query = f"""
-        SELECT * FROM '{parquet_file}'
+        SELECT 
+            MLBID,
+            pitch_type,
+            AVG(release_pos_z) AS release_pos_z,
+            AVG(release_pos_x) AS release_pos_x,
+            AVG(release_extension) AS release_extension,
+            AVG(release_speed) AS release_speed,
+            AVG(effective_speed) AS effective_speed,
+            AVG(pfx_x) AS pfx_x,
+            AVG(pfx_z) AS pfx_z,
+            AVG(plate_x) AS plate_x,
+            AVG(plate_z) AS plate_z,
+            COUNT(*) as sample_size
+        FROM '{parquet_file}'
         WHERE release_pos_z BETWEEN {target_z - z_tolerance} AND {target_z + z_tolerance}
           AND release_pos_x BETWEEN {target_x - x_tolerance} AND {target_x + x_tolerance}
-        LIMIT 5000
+        GROUP BY MLBID, pitch_type
+        HAVING COUNT(*) >= 10
     """
     try:
         slot_df = con.query(query).df()
@@ -86,12 +99,9 @@ def get_strict_biomechanical_clone(
         con.close()
 
     if slot_df.empty:
-        raise ValueError(f"No historical pitches found within {z_tolerance}ft Z and {x_tolerance}ft X.")
+        raise ValueError(f"No average profiles found within {z_tolerance}ft Z and {x_tolerance}ft X.")
 
     slot_df = preprocess_atlas_data(slot_df)
-    
-    if slot_df.empty:
-        raise ValueError("Historical pitches were found, but all lacked required plate/movement data.")
 
     scaler = StandardScaler()
     
@@ -105,48 +115,42 @@ def get_strict_biomechanical_clone(
     candidates_raw = slot_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
     
     scaler.fit(candidates_raw)
-
     weights = np.ones(len(FEATURES))
     
     target_weighted = scaler.transform(target_raw) * weights
     candidates_weighted = scaler.transform(candidates_raw) * weights
 
+    # Find the single closest AVERAGE profile
     distances = cdist(target_weighted, candidates_weighted, metric='euclidean')[0]
-
-    sorted_indices = np.argsort(distances)
-    best_idx = sorted_indices[0]
+    best_idx = np.argsort(distances)[0]
     best_dist = distances[best_idx]
 
-    clone_pitch = slot_df.iloc[best_idx]
+    clone_profile = slot_df.iloc[best_idx].copy()
 
-    return clone_pitch, best_dist
+    # 🚨 PYDANTIC SAFETY NET: Since averages don't have "game_date" or "description", 
+    # we borrow those dummy columns from your target input so FastAPI doesn't crash!
+    for col in target_df.columns:
+        if col not in clone_profile.index:
+            clone_profile[col] = target_df[col].iloc[0]
+
+    return clone_profile, best_dist
 
 # ==========================================
 # MAIN RECOMMENDER
 # ==========================================
 
-# 🚨 THE FIX IS HERE: pitcher_id_col is now set to "MLBID"
 def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "MLBID", pitch_type_col: str = "pitch_type") -> dict:
-    """Recommends a pitch arsenal based on the strict biomechanical clone."""
-    logger.info("Generating strictly constrained arsenal recommendation...")
+    """Recommends an arsenal based on the pitcher whose average profile best matches."""
+    logger.info("Generating average profile arsenal recommendation...")
     
     try:
-        clone_pitch, distance = get_strict_biomechanical_clone(target_df)
+        clone_pitch, distance = get_average_pitch_profile_clone(target_df)
     except Exception as e:
         logger.error(f"Arsenal Recommendation Failed: {e}")
-        return {
-            "error": str(e),
-            "clone_pitch": None,
-            "distance": None,
-            "arsenal": [],
-            "group_arsenal": []
-        }
+        return {"error": str(e), "clone_pitch": None, "distance": None, "arsenal": [], "group_arsenal": []}
     
-    # Safely extract Pitcher ID
+    # Safely extract Pitcher ID from the matched average profile
     raw_id = clone_pitch.get(pitcher_id_col)
-    if pd.isna(raw_id) and 'pitcher_id' in clone_pitch:
-        raw_id = clone_pitch.get('pitcher_id')
-        
     try:
         clone_pitcher_id = int(float(raw_id))
     except (ValueError, TypeError):
@@ -168,29 +172,27 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "MLBID", pi
     finally:
         con.close()
     
-    # Calculate Arsenal Usages
+    # Calculate Arsenal Usages for that specific Pitcher
     if not pitcher_df.empty:
         pitcher_df['pitch_group'] = pitcher_df[pitch_type_col].map(PITCH_GROUPS).fillna('Unknown')
         
         arsenal = pitcher_df[pitch_type_col].value_counts(normalize=True).reset_index()
         arsenal.columns = ["pitch_type", "usage"]
-        arsenal['usage'] = arsenal['usage'].astype(float) # Force standard Python float
+        arsenal['usage'] = arsenal['usage'].astype(float)
         arsenal_data = arsenal.to_dict(orient="records")
         
         group_arsenal = pitcher_df["pitch_group"].value_counts(normalize=True).reset_index()
         group_arsenal.columns = ["pitch_group", "usage"]
-        group_arsenal['usage'] = group_arsenal['usage'].astype(float) # Force standard Python float
+        group_arsenal['usage'] = group_arsenal['usage'].astype(float)
         group_arsenal_data = group_arsenal.to_dict(orient="records")
     else:
         arsenal_data = []
         group_arsenal_data = []
         
-    logger.info(f"Arsenal generated matching arm slot for pitcher {clone_pitcher_id}")
+    logger.info(f"Arsenal generated matching average profile for pitcher {clone_pitcher_id}")
     
-    # Convert entire clone_pitch to a safe Python dictionary for Pydantic
     clean_clone = clone_pitch.replace({np.nan: None, pd.NA: None}).to_dict()
     
-    # Return EXACTLY what the FastAPI blueprint expects so it doesn't block the data
     return {
         "clone_pitch": clean_clone, 
         "distance": float(distance),
