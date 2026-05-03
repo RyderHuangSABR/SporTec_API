@@ -89,6 +89,9 @@ def get_strict_biomechanical_clone(
         raise ValueError(f"No historical pitches found within {z_tolerance}ft Z and {x_tolerance}ft X.")
 
     slot_df = preprocess_atlas_data(slot_df)
+    
+    if slot_df.empty:
+        raise ValueError("Historical pitches were found, but all lacked required plate/movement data.")
 
     scaler = StandardScaler()
     
@@ -132,13 +135,13 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
         logger.error(f"Arsenal Recommendation Failed: {e}")
         return {
             "error": str(e),
-            "clone_pitch": {"pitcher_id": None},
+            "clone_pitch": None,
             "distance": None,
             "arsenal": [],
             "group_arsenal": []
         }
     
-    # 🚨 FIX 1: Safely extract Pitcher ID (handles floats, strings, and missing data)
+    # Safely extract Pitcher ID
     raw_id = clone_pitch.get(pitcher_id_col)
     if pd.isna(raw_id) and 'pitcher_id' in clone_pitch:
         raw_id = clone_pitch.get('pitcher_id')
@@ -146,4 +149,50 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
     try:
         clone_pitcher_id = int(float(raw_id))
     except (ValueError, TypeError):
-        return
+        clone_pitcher_id = 0
+
+    parquet_file = get_parquet_path()
+    con = get_duckdb_conn()
+    
+    arsenal_query = f"""
+        SELECT {pitch_type_col}
+        FROM '{parquet_file}' 
+        WHERE {pitcher_id_col} = {clone_pitcher_id}
+    """
+    try:
+        pitcher_df = con.query(arsenal_query).df()
+    except Exception as e:
+        logger.warning(f"Failed to query pitch arsenal for {clone_pitcher_id}: {e}")
+        pitcher_df = pd.DataFrame()
+    finally:
+        con.close()
+    
+    # Calculate Arsenal Usages
+    if not pitcher_df.empty:
+        pitcher_df['pitch_group'] = pitcher_df[pitch_type_col].map(PITCH_GROUPS).fillna('Unknown')
+        
+        arsenal = pitcher_df[pitch_type_col].value_counts(normalize=True).reset_index()
+        arsenal.columns = ["pitch_type", "usage"]
+        arsenal['usage'] = arsenal['usage'].astype(float) # Force standard Python float
+        arsenal_data = arsenal.to_dict(orient="records")
+        
+        group_arsenal = pitcher_df["pitch_group"].value_counts(normalize=True).reset_index()
+        group_arsenal.columns = ["pitch_group", "usage"]
+        group_arsenal['usage'] = group_arsenal['usage'].astype(float) # Force standard Python float
+        group_arsenal_data = group_arsenal.to_dict(orient="records")
+    else:
+        arsenal_data = []
+        group_arsenal_data = []
+        
+    logger.info(f"Arsenal generated matching arm slot for pitcher {clone_pitcher_id}")
+    
+    # Convert entire clone_pitch to a safe Python dictionary for Pydantic
+    clean_clone = clone_pitch.replace({np.nan: None, pd.NA: None}).to_dict()
+    
+    # Return EXACTLY what the FastAPI blueprint expects so it doesn't block the data
+    return {
+        "clone_pitch": clean_clone, 
+        "distance": float(distance),
+        "arsenal": arsenal_data,
+        "group_arsenal": group_arsenal_data
+    }
