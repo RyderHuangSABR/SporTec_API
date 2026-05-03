@@ -4,7 +4,6 @@ import secrets
 import logging
 import duckdb
 import pandas as pd
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks
 from fastapi.security import APIKeyHeader
@@ -13,45 +12,17 @@ from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from sklearn.preprocessing import StandardScaler
 
 from engine.recommender import recommend_arsenal
-from engine.loader import load_atlas_data
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas_api")
 
-# --- LIFESPAN (Runs once when server starts) ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 Starting up: Downloading Hugging Face data...")
-    try:
-        # 1. Download the data using your loader
-        df_master, df_dict = load_atlas_data()
-        
-        # 2. Store it in app.state so the whole app can access it in RAM
-        app.state.df = df_master
-        app.state.target_dict = df_dict
-        
-        # 3. Create your Scaler and Weights
-        app.state.scaler = StandardScaler() 
-        # (If your scaler needs fitting, you'd do it here like: app.state.scaler.fit(df_master[['col1', 'col2']]))
-        app.state.weights = [1.0, 1.0, 1.0, 1.0, 1.0] # Replace with your actual weights
-        
-        logger.info("✅ ML Brain loaded into RAM! Opening for traffic...")
-    except Exception as e:
-        logger.error(f"❌ Failed to load ML assets: {e}")
-        
-    yield
-    
-    logger.info("🛑 Shutting down server...")
-
 # --- APP INIT ---
 app = FastAPI(
     title="Atlas Pitching Analytics API",
-    version="2.0.0",
-    lifespan=lifespan  # 🚨 Added the lifespan here!
+    version="2.0.0"
 )
 
 # --- RATE LIMITING ---
@@ -97,15 +68,13 @@ db = init_db()
 # --- SECURITY ---
 api_key_header = APIKeyHeader(name="X-API-Key")
 
-# Pull your Master Key from Render's Environment Vault
+# Pull Master Key from Render Environment
 MASTER_KEY = os.getenv("API_KEY", "6YHN4RFV3edc@")
 
 def authenticate_client(api_key: str = Security(api_key_header)):
-    # Master Key Override (Survives Render Restarts!)
     if api_key == MASTER_KEY:
         return "Atlas Admin"
 
-    # Client Key Check (Looks in DuckDB for generated keys)
     result = db.execute(
         "SELECT client_name FROM api_clients WHERE api_key = ?",
         [api_key]
@@ -183,14 +152,9 @@ async def predict_pitch(
     try:
         df_input = pd.DataFrame([pitch.model_dump()])
         
-        # 🚨 FIX: Pass ALL 5 required parameters from the app state
-        result = recommend_arsenal(
-            target_features=df_input,
-            target_dict=request.app.state.target_dict,
-            scaler=request.app.state.scaler,
-            weights=request.app.state.weights,
-            df=request.app.state.df
-        )
+        # We temporarily revert this to just passing df_input to prevent the OOM
+        # (This will still throw the 500 error for now, but the server will boot safely)
+        result = recommend_arsenal(df_input)
 
         background_tasks.add_task(
             log_application_telemetry,
