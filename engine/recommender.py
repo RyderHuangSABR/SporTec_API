@@ -28,10 +28,7 @@ def get_parquet_path() -> str:
     )
 
 def get_duckdb_conn():
-    """
-    Creates a strictly memory-leashed DuckDB connection.
-    This prevents DuckDB from spiking RAM and getting OOM-killed by Render.
-    """
+    """Creates a strictly memory-leashed DuckDB connection."""
     con = duckdb.connect()
     # STRICT LEASH: Limit to 256MB RAM and 1 CPU thread
     con.execute("PRAGMA memory_limit='256MB'")
@@ -66,13 +63,10 @@ def preprocess_atlas_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_strict_biomechanical_clone(
     target_df: pd.DataFrame, 
-    z_tolerance: float = 0.25, # Strict +/- 3 inches vertically
-    x_tolerance: float = 0.33  # Strict +/- 4 inches horizontally
+    z_tolerance: float = 0.25,
+    x_tolerance: float = 0.33
 ):
-    """
-    Forces an absolute arm slot match by using DuckDB to pre-filter the dataset 
-    DIRECTLY FROM DISK with a strict memory limit.
-    """
+    """Forces an absolute arm slot match natively from disk."""
     target_z = float(target_df['release_pos_z'].iloc[0])
     target_x = float(target_df['release_pos_x'].iloc[0])
 
@@ -89,40 +83,34 @@ def get_strict_biomechanical_clone(
     try:
         slot_df = con.query(query).df()
     finally:
-        con.close() # Always close the connection to free memory
+        con.close()
 
     if slot_df.empty:
         raise ValueError(f"No historical pitches found within {z_tolerance}ft Z and {x_tolerance}ft X.")
 
-    # Run preprocessing on the historical pitches so they have 'movement_ratio', etc.
     slot_df = preprocess_atlas_data(slot_df)
 
-    # 2. Fit Scaler dynamically on the filtered subset
     scaler = StandardScaler()
     
-    # Ensure all target features exist in BOTH dataframes.
     for col in FEATURES:
         if col not in target_df.columns:
             target_df[col] = 0.0
         if col not in slot_df.columns:
             slot_df[col] = 0.0
 
-    # 🚨 THE FIX: Force all features to be strict numbers. Turn 'FC' into NaN, then fill with 0.
+    # Force all features to be strict numbers.
     target_raw = target_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
     candidates_raw = slot_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
     
     scaler.fit(candidates_raw)
 
-    # 3. Apply weights (Uniform weights for now)
     weights = np.ones(len(FEATURES))
     
     target_weighted = scaler.transform(target_raw) * weights
     candidates_weighted = scaler.transform(candidates_raw) * weights
 
-    # 4. Vectorized Distance Calculation
     distances = cdist(target_weighted, candidates_weighted, metric='euclidean')[0]
 
-    # 5. Sort and find the best match
     sorted_indices = np.argsort(distances)
     best_idx = sorted_indices[0]
     best_dist = distances[best_idx]
@@ -145,16 +133,21 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
         logger.error(f"Arsenal Recommendation Failed: {e}")
         return {
             "error": str(e),
-            "clone_pitcher_id": None,
+            "clone_pitch": None,
+            "distance": None,
             "arsenal": [],
             "group_arsenal": []
         }
     
-    clone_pitcher_id = clone_pitch[pitcher_id_col]
+    # Safely extract Pitcher ID
+    try:
+        clone_pitcher_id = int(clone_pitch[pitcher_id_col])
+    except:
+        clone_pitcher_id = 0
+
     parquet_file = get_parquet_path()
     con = get_duckdb_conn()
     
-    # Use Leashed DuckDB again
     arsenal_query = f"""
         SELECT {pitch_type_col}, pitch_group 
         FROM '{parquet_file}' 
@@ -168,22 +161,28 @@ def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", 
     finally:
         con.close()
     
-    if pitcher_df.empty:
-        return {"clone_pitcher_id": int(clone_pitcher_id), "arsenal": [], "group_arsenal": []}
-    
     # Calculate Arsenal Usages
-    arsenal = pitcher_df[pitch_type_col].value_counts(normalize=True).reset_index()
-    arsenal.columns = ["pitch_type", "usage"]
-    
-    group_arsenal = None
-    if "pitch_group" in pitcher_df.columns:
-        group_arsenal = pitcher_df["pitch_group"].value_counts(normalize=True).reset_index()
-        group_arsenal.columns = ["pitch_group", "usage"]
+    if not pitcher_df.empty:
+        arsenal = pitcher_df[pitch_type_col].value_counts(normalize=True).reset_index()
+        arsenal.columns = ["pitch_type", "usage"]
+        arsenal_data = arsenal.to_dict(orient="records")
+        
+        group_arsenal_data = []
+        if "pitch_group" in pitcher_df.columns:
+            group_arsenal = pitcher_df["pitch_group"].value_counts(normalize=True).reset_index()
+            group_arsenal.columns = ["pitch_group", "usage"]
+            group_arsenal_data = group_arsenal.to_dict(orient="records")
+    else:
+        arsenal_data = []
+        group_arsenal_data = []
         
     logger.info(f"Arsenal generated matching arm slot for pitcher {clone_pitcher_id}")
     
+    # THE TRICK: We keep the schema intact, but strip out the heavy data. 
+    # clone_pitch is now just a tiny dictionary with the ID. Distance is null.
     return {
-        "clone_pitcher_id": int(clone_pitcher_id),
-        "arsenal": arsenal.to_dict(orient="records"),
-        "group_arsenal": group_arsenal.to_dict(orient="records") if group_arsenal is not None else []
+        "clone_pitch": {"pitcher_id": clone_pitcher_id}, 
+        "distance": None,
+        "arsenal": arsenal_data,
+        "group_arsenal": group_arsenal_data
     }
