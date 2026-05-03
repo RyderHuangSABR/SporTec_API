@@ -125,7 +125,8 @@ def get_strict_biomechanical_clone(
 # MAIN RECOMMENDER
 # ==========================================
 
-def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "pitcher", pitch_type_col: str = "pitch_type") -> dict:
+# 🚨 THE FIX IS HERE: pitcher_id_col is now set to "MLBID"
+def recommend_arsenal(target_df: pd.DataFrame, pitcher_id_col: str = "MLBID", pitch_type_col: str = "pitch_type") -> dict:
     """Recommends a pitch arsenal based on the strict biomechanical clone."""
     logger.info("Generating strictly constrained arsenal recommendation...")
     
