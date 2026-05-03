@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def load_gmm_profiles() -> pd.DataFrame:
     """Loads the pre-calculated GMM centroids from the local CSV."""
     # This expects the Kaggle output to be saved in an 'atlas' folder in your project root
-    csv_path = os.path.join("atlas", "gmm_pitch_profiles.csv")
+    csv_path = os.path.join("Atlas", "gmm_pitch_profiles.csv")
     
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Missing {csv_path}. Please place the Kaggle output in the 'atlas' folder.")
