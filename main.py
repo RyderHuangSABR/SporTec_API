@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
     # We no longer need to download the Parquet file! 
     # Just ensure the GMM CSV is in the /atlas folder.
     logger.info("🚀 Atlas API Starting Up...")
-    if not os.path.exists("atlas/gmm_pitch_profiles.csv"):
+    if not os.path.exists("Atlas/gmm_pitch_profiles.csv"):
         logger.error("❌ CRITICAL: gmm_pitch_profiles.csv not found in /atlas directory!")
     else:
         logger.info("✅ GMM Profiles found. Ready for deployment.")
