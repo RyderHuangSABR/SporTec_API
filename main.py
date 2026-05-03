@@ -4,6 +4,8 @@ import secrets
 import logging
 import duckdb
 import pandas as pd
+from contextlib import asynccontextmanager
+from huggingface_hub import hf_hub_download
 
 from fastapi import FastAPI, HTTPException, Security, Request, BackgroundTasks
 from fastapi.security import APIKeyHeader
@@ -19,10 +21,28 @@ from engine.recommender import recommend_arsenal
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas_api")
 
+# --- LIFESPAN: PRE-DOWNLOAD TO DISK (ZERO RAM) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 Starting up: Downloading Hugging Face data to hard drive...")
+    try:
+        # This downloads the file and caches it on the disk safely. 
+        hf_hub_download(
+            repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
+            filename="Atlas/Atlas_Pitching.parquet", 
+            repo_type="dataset", 
+            token=os.getenv("HF_TOKEN")
+        )
+        logger.info("✅ Download complete! Server is unblocked and ready for traffic.")
+    except Exception as e:
+        logger.error(f"❌ Failed to download data: {e}")
+    yield
+
 # --- APP INIT ---
 app = FastAPI(
     title="Atlas Pitching Analytics API",
-    version="2.0.0"
+    version="2.0.0",
+    lifespan=lifespan # 🚨 This triggers the pre-download on boot!
 )
 
 # --- RATE LIMITING ---
@@ -152,8 +172,6 @@ async def predict_pitch(
     try:
         df_input = pd.DataFrame([pitch.model_dump()])
         
-        # We temporarily revert this to just passing df_input to prevent the OOM
-        # (This will still throw the 500 error for now, but the server will boot safely)
         result = recommend_arsenal(df_input)
 
         background_tasks.add_task(
