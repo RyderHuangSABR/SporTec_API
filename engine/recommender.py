@@ -87,4 +87,33 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
         group_arsenal_data = sorted(group_arsenal_data, key=lambda x: x['usage'], reverse=True)
         
         # 6. Safety Net for FastAPI Pydantic Models
-        clean_clone =
+        clean_clone = clone_pitch.replace({np.nan: None}).to_dict()
+        for col in target_df.columns:
+            if col not in clean_clone:
+                clean_clone[col] = target_df[col].iloc[0]
+
+        # 7. The Coach-Friendly Output JSON
+        logger.info(f"Matched pitcher {clone_pitcher_id} in {best_dist:.2f} distance.")
+        
+        return {
+            "identity": {
+                "matched_pitcher_id": int(clone_pitcher_id),
+                "matched_pitch_type": matched_pitch_type,
+                "coach_cue": f"This pitch moves and releases naturally like a {matched_pitch_type} from pitcher ID {int(clone_pitcher_id)}."
+            },
+            "arsenal": arsenal_data,
+            "group_arsenal": group_arsenal_data,
+            "distance": float(best_dist), 
+            "clone_pitch": clean_clone    
+        }
+        
+    except Exception as e:
+        logger.error(f"GMM Match Failed: {e}")
+        return {
+            "error": str(e), 
+            "identity": None, 
+            "arsenal": [], 
+            "group_arsenal": [], 
+            "distance": None,
+            "clone_pitch": None
+        }
