@@ -23,9 +23,9 @@ logger = logging.getLogger("atlas_api")
 # --- LIFESPAN: INSTANT BOOT ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # We deleted the Hugging Face download! 
-    # It just boots instantly using the local CSV now.
-    logger.info("🚀 Starting up: Atlas API loading local GMM profiles...")
+    # Render needs this to boot instantly. 
+    # All Hugging Face downloads happen lazily on the first request!
+    logger.info("🚀 Starting up: Atlas API is ready and waiting for traffic...")
     yield
 
 # --- APP INIT ---
@@ -97,6 +97,7 @@ def authenticate_client(api_key: str = Security(api_key_header)):
 
 # --- MODELS ---
 class TargetPitch(BaseModel):
+    pitch_type: str = "FF"  # Added so the dynamic XGBoost router knows which model to download!
     p_throws: str
     vaa: float
     haa: float
@@ -138,6 +139,7 @@ def log_application_telemetry(client_name: str, pitch_data: dict, recommendation
 
 @app.get("/")
 async def root():
+    """Render hits this to ensure the server bound to the port successfully."""
     return {
         "status": "ok",
         "service": "Atlas API",
