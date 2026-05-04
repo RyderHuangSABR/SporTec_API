@@ -83,10 +83,18 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
         target_pitch_group = PITCH_GROUPS.get(target_pitch_type, "Fastball")
         
         # 1. Prepare Target and Candidates
+        
+        # Safety net for the user's incoming pitch
         for col in FEATURES:
             if col not in target_df.columns:
                 target_df[col] = 0.0
                 
+        # NEW: Safety net for the GMM CSV
+        for col in FEATURES:
+            if col not in profiles_df.columns:
+                profiles_df[col] = 0.0
+                
+        # Now it will slice perfectly without throwing a KeyError
         target_raw = target_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
         candidates_raw = profiles_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
         
