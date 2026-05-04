@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
 # 1. LOAD THE PRE-TRAINED GMM PROFILES
 # ==========================================
 def load_gmm_profiles() -> pd.DataFrame:
-    """Loads the pre-calculated GMM centroids from the local CSV."""
-    # This expects the Kaggle output to be saved in an 'atlas' folder in your project root
-    csv_path = os.path.join("Atlas", "gmm_pitch_profiles.csv")
+    """Loads the pre-calculated GMM centroids using a bulletproof absolute path."""
+    # __file__ is engine/recommender.py
+    # This dynamically finds the root directory of your project, no matter where Render runs it
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    csv_path = os.path.join(base_dir, "Atlas", "gmm_pitch_profiles.csv")
     
     if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Missing {csv_path}. Please place the Kaggle output in the 'atlas' folder.")
+        raise FileNotFoundError(f"Missing {csv_path}. Please place the Kaggle output in the 'Atlas' folder.")
     
     return pd.read_csv(csv_path)
 
@@ -96,10 +98,8 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
             },
             "arsenal": arsenal_data,
             "group_arsenal": group_arsenal_data,
-            "analytics": {
-                "distance": float(best_dist),
-                "clone_pitch": clean_clone
-            }
+            "distance": float(best_dist), # Moved to top level so main.py telemetry doesn't crash
+            "clone_pitch": clean_clone    # Moved to top level
         }
         
     except Exception as e:
@@ -109,5 +109,6 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
             "identity": None, 
             "arsenal": [], 
             "group_arsenal": [], 
-            "analytics": None
+            "distance": None,
+            "clone_pitch": None
         }
