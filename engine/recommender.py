@@ -4,6 +4,7 @@ import pandas as pd
 import logging
 from scipy.spatial.distance import cdist
 from sklearn.preprocessing import StandardScaler
+from huggingface_hub import hf_hub_download
 
 # Import constants from your features module
 from engine.features import FEATURES, PITCH_GROUPS
@@ -14,16 +15,20 @@ logger = logging.getLogger(__name__)
 # 1. LOAD THE PRE-TRAINED GMM PROFILES
 # ==========================================
 def load_gmm_profiles() -> pd.DataFrame:
-    """Loads the pre-calculated GMM centroids using a bulletproof absolute path."""
-    # __file__ is engine/recommender.py
-    # This dynamically finds the root directory of your project, no matter where Render runs it
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    csv_path = os.path.join(base_dir, "Atlas", "gmm_pitch_profiles.csv")
+    """Downloads the GMM centroids from Hugging Face (or instantly loads from cache)."""
+    token = os.getenv("HF_TOKEN")
     
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Missing {csv_path}. Please place the Kaggle output in the 'Atlas' folder.")
-    
-    return pd.read_csv(csv_path)
+    try:
+        csv_path = hf_hub_download(
+            repo_id="RyderHuangSABR/Atlas_Pitching_Data", 
+            filename="Atlas/gmm_pitch_profiles.csv", 
+            repo_type="dataset", 
+            token=token
+        )
+        return pd.read_csv(csv_path)
+    except Exception as e:
+        logger.error(f"Hugging Face Download Failed: {e}")
+        raise FileNotFoundError("Could not pull from Hugging Face. Ensure your HF_TOKEN is correct and the file exists in the repo.")
 
 # ==========================================
 # 2. MAIN RECOMMENDER (LIGHTNING FAST)
@@ -82,33 +87,4 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
         group_arsenal_data = sorted(group_arsenal_data, key=lambda x: x['usage'], reverse=True)
         
         # 6. Safety Net for FastAPI Pydantic Models
-        clean_clone = clone_pitch.replace({np.nan: None}).to_dict()
-        for col in target_df.columns:
-            if col not in clean_clone:
-                clean_clone[col] = target_df[col].iloc[0]
-
-        # 7. The Coach-Friendly Output JSON
-        logger.info(f"Matched pitcher {clone_pitcher_id} in {best_dist:.2f} distance.")
-        
-        return {
-            "identity": {
-                "matched_pitcher_id": int(clone_pitcher_id),
-                "matched_pitch_type": matched_pitch_type,
-                "coach_cue": f"This pitch moves and releases naturally like a {matched_pitch_type} from pitcher ID {int(clone_pitcher_id)}."
-            },
-            "arsenal": arsenal_data,
-            "group_arsenal": group_arsenal_data,
-            "distance": float(best_dist), # Moved to top level so main.py telemetry doesn't crash
-            "clone_pitch": clean_clone    # Moved to top level
-        }
-        
-    except Exception as e:
-        logger.error(f"GMM Match Failed: {e}")
-        return {
-            "error": str(e), 
-            "identity": None, 
-            "arsenal": [], 
-            "group_arsenal": [], 
-            "distance": None,
-            "clone_pitch": None
-        }
+        clean_clone =
