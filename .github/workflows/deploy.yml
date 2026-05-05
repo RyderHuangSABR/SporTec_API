@@ -17,8 +17,10 @@ jobs:
         with:
           python-version: "3.11" 
 
-      - name: Install Modal
-        run: pip install modal
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install modal duckdb pandas fastapi pydantic slowapi xgboost scikit-learn scipy huggingface_hub
 
       - name: Deploy to Modal Cloud
         run: modal deploy main.py
