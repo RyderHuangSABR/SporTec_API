@@ -242,7 +242,7 @@ async def generate_api_key(req: APIKeyRequest):
     image=image, 
     secrets=[modal.Secret.from_name("my-huggingface-secret-2")], 
     volumes={"/data": db_volume},
-    keep_warm=1 # Keeps at least 1 server ready instantly so it doesn't cold boot
+    min_containers=1 # Keeps at least 1 server ready instantly so it doesn't cold boot
 )
 @modal.asgi_app()
 def fastapi_app():
