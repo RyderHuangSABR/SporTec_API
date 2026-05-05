@@ -1,4 +1,3 @@
-# main.py
 import os
 import secrets
 import logging
@@ -14,7 +13,31 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+import modal
 from engine.recommender import recommend_arsenal
+
+# ==========================================
+# 1. MODAL CLOUD CONFIGURATION
+# ==========================================
+# Build the container with all required libraries
+image = modal.Image.debian_slim().pip_install(
+    "fastapi[standard]", 
+    "pandas", 
+    "numpy", 
+    "xgboost", 
+    "scikit-learn", 
+    "scipy", 
+    "huggingface_hub", 
+    "duckdb", 
+    "slowapi", 
+    "pydantic"
+)
+
+app_modal = modal.App("atlas-pitching-api")
+
+# Create a permanent cloud hard drive to protect your DuckDB database
+db_volume = modal.Volume.from_name("atlas-db-volume", create_if_missing=True)
+DB_PATH = "/data/atlas_application.db"
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
@@ -23,9 +46,7 @@ logger = logging.getLogger("atlas_api")
 # --- LIFESPAN: INSTANT BOOT ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Render needs this to boot instantly. 
-    # All Hugging Face downloads happen lazily on the first request!
-    logger.info("🚀 Starting up: Atlas API is ready and waiting for traffic...")
+    logger.info("🚀 Starting up: Atlas API is active on Modal...")
     yield
 
 # --- APP INIT ---
@@ -49,9 +70,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATABASE INIT ---
+# ==========================================
+# 2. DATABASE INIT (MOVED TO CLOUD VOLUME)
+# ==========================================
 def init_db():
-    db = duckdb.connect("atlas_application.db")
+    # Connect to the indestructible Modal Volume path
+    db = duckdb.connect(DB_PATH)
     db.execute("""
         CREATE TABLE IF NOT EXISTS api_clients (
             api_key TEXT PRIMARY KEY,
@@ -73,22 +97,22 @@ def init_db():
     """)
     return db
 
-db = init_db()
-
 # --- SECURITY ---
 api_key_header = APIKeyHeader(name="X-API-Key")
 
-# Pull Master Key from Render Environment
-MASTER_KEY = os.getenv("API_KEY", "6YHN4RFV3edc@")
-
 def authenticate_client(api_key: str = Security(api_key_header)):
+    # Pull Master Key dynamically from the environment
+    MASTER_KEY = os.getenv("API_KEY", "6YHN4RFV3edc@")
+    
     if api_key == MASTER_KEY:
         return "Atlas Admin"
 
+    db = duckdb.connect(DB_PATH)
     result = db.execute(
         "SELECT client_name FROM api_clients WHERE api_key = ?",
         [api_key]
     ).fetchone()
+    db.close()
 
     if not result:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -97,7 +121,7 @@ def authenticate_client(api_key: str = Security(api_key_header)):
 
 # --- MODELS ---
 class TargetPitch(BaseModel):
-    pitch_type: str = "FF"  # Added so the dynamic XGBoost router knows which model to download!
+    pitch_type: str = "FF" 
     p_throws: str
     vaa: float
     haa: float
@@ -116,7 +140,7 @@ class APIKeyRequest(BaseModel):
 # --- TELEMETRY ---
 def log_application_telemetry(client_name: str, pitch_data: dict, recommendation: dict):
     try:
-        # Extracting from the new GMM dictionary structure safely
+        db = duckdb.connect(DB_PATH)
         identity = recommendation.get("identity") or {}
         
         db.execute("""
@@ -132,27 +156,26 @@ def log_application_telemetry(client_name: str, pitch_data: dict, recommendation
             recommendation.get("distance", 999.9),
             identity.get("matched_pitcher_id", 0)
         ])
+        db.close()
     except Exception as e:
         logger.error(f"Telemetry failed: {e}")
 
-# --- ROUTES ---
+# ==========================================
+# 3. ROUTES
+# ==========================================
 
 @app.get("/")
 async def root():
-    """Render hits this to ensure the server bound to the port successfully."""
     return {
         "status": "ok",
-        "service": "Atlas API",
+        "service": "Atlas API running on Modal",
         "docs": "/docs"
     }
 
 @app.get("/health")
 @limiter.limit("5/minute")
 async def health_check(request: Request):
-    return {
-        "status": "healthy",
-        "service": "Atlas API"
-    }
+    return {"status": "healthy", "service": "Atlas API"}
 
 @app.post("/api/v1/predict")
 @limiter.limit("10/minute")
@@ -166,7 +189,6 @@ async def predict_pitch(
 
     try:
         df_input = pd.DataFrame([pitch.model_dump()])
-        
         result = recommend_arsenal(df_input)
 
         background_tasks.add_task(
@@ -196,10 +218,12 @@ async def generate_api_key(req: APIKeyRequest):
     new_api_key = f"atl_{secrets.token_hex(16)}"
 
     try:
+        db = duckdb.connect(DB_PATH)
         db.execute(
             "INSERT INTO api_clients (api_key, client_name, tier) VALUES (?, ?, ?)",
             [new_api_key, req.client_name, req.tier]
         )
+        db.close()
 
         return {
             "status": "success",
@@ -210,3 +234,18 @@ async def generate_api_key(req: APIKeyRequest):
     except Exception as e:
         logger.error(f"Key generation error: {e}")
         raise HTTPException(status_code=500, detail="Database error")
+
+# ==========================================
+# 4. MODAL ASGI WRAPPER (THE ENGINE)
+# ==========================================
+@app_modal.function(
+    image=image, 
+    secrets=[modal.Secret.from_name("my-huggingface-secret-2")], 
+    volumes={"/data": db_volume},
+    keep_warm=1 # Keeps at least 1 server ready instantly so it doesn't cold boot
+)
+@modal.asgi_app()
+def fastapi_app():
+    # Initialize the database on the hard drive right before handing off to FastAPI
+    init_db()
+    return app
