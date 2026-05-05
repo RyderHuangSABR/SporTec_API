@@ -20,17 +20,22 @@ from engine.recommender import recommend_arsenal
 # 1. MODAL CLOUD CONFIGURATION
 # ==========================================
 # Build the container with all required libraries
-image = modal.Image.debian_slim().pip_install(
-    "fastapi[standard]", 
-    "pandas", 
-    "numpy", 
-    "xgboost", 
-    "scikit-learn", 
-    "scipy", 
-    "huggingface_hub", 
-    "duckdb", 
-    "slowapi", 
-    "pydantic"
+image = (
+    modal.Image.debian_slim()
+    .pip_install(
+        "duckdb", 
+        "pandas", 
+        "fastapi", 
+        "pydantic", 
+        "slowapi", 
+        "xgboost", 
+        "scikit-learn", 
+        "scipy", 
+        "huggingface_hub"
+    )
+    # This line is the magic fix. 
+    # It tells Modal: "Hey, take my local 'engine' folder and put it in the cloud server."
+    .add_local_dir("engine", remote_path="/root/engine")
 )
 
 app_modal = modal.App("atlas-pitching-api")
