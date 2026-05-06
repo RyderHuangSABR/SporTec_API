@@ -25,8 +25,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install modal duckdb pandas fastapi pydantic slowapi xgboost scikit-learn scipy huggingface_hub joblib
 
+      # ==========================================
+      # THE FIX: Explicitly target app_modal
+      # ==========================================
       - name: Deploy to Modal Cloud
-        run: modal deploy main.py
+        run: modal deploy main.py::app_modal
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
