@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 import logging
-import joblib # <--- NEW IMPORT FOR YOUR MODELS
+import joblib 
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
 from huggingface_hub import hf_hub_download
@@ -76,7 +76,7 @@ def load_xgb_weights(pitch_group: str) -> np.ndarray:
 # 4. MAIN RECOMMENDER (POWERED BY JOBLIB)
 # ==========================================
 def recommend_arsenal(target_df: pd.DataFrame) -> dict:
-    """Matches pitch using serialized GMM and KNN models."""
+    """Matches pitch using serialized GMM and KNN models, avoiding self-matches."""
     logger.info("Initializing ML pipeline matching...")
     
     try:
@@ -87,6 +87,13 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
         
         target_pitch_type = target_df['pitch_type'].iloc[0] if 'pitch_type' in target_df.columns else "FF"
         target_pitch_group = PITCH_GROUPS.get(target_pitch_type, "Fastball")
+        
+        # Identify the target pitcher's ID so we don't match them with themselves
+        target_pitcher_id = None
+        if 'pitcher' in target_df.columns:
+            target_pitcher_id = target_df['pitcher'].iloc[0]
+        elif 'MLBID' in target_df.columns:
+            target_pitcher_id = target_df['MLBID'].iloc[0]
         
         # 1. Prepare Features
         for col in FEATURES:
@@ -105,17 +112,36 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
         
         target_weighted = scaler.transform(target_raw) * xgb_weights
         
-        # 3. GMM Prediction (What "Pitch Profile Bucket" is this?)
-        # We predict the cluster ID, which you can use for advanced logic later
+        # 3. GMM Prediction
         cluster_id = gmm_model.predict(target_weighted)[0]
         logger.info(f"GMM assigned this pitch to Cluster ID: {cluster_id}")
         
-        # 4. KNN Math (Find the exact MLB Clone)
-        # We ask KNN for the single closest neighbor (n_neighbors=1)
-        distances, indices = knn_model.kneighbors(target_weighted, n_neighbors=1)
+        # 4. KNN Math (Ask for Top 5 to avoid Target Leakage)
+        distances, indices = knn_model.kneighbors(target_weighted, n_neighbors=5)
         
-        best_idx = indices[0][0]
-        best_dist = distances[0][0]
+        best_idx = None
+        best_dist = None
+        
+        # Loop through the top 5 closest pitches
+        for i in range(len(indices[0])):
+            idx = indices[0][i]
+            dist = distances[0][i]
+            candidate_mlbid = profiles_df.iloc[idx]['MLBID']
+            
+            # Check for the "Self-Match" bug: Skip if it's the exact same guy
+            if target_pitcher_id is not None and pd.notna(target_pitcher_id):
+                if int(candidate_mlbid) == int(target_pitcher_id):
+                    continue # Skip to the next closest neighbor
+            
+            # If it's a different pitcher, lock it in and break the loop!
+            best_idx = idx
+            best_dist = dist
+            break
+            
+        # Fallback: If somehow all 5 matches were the exact same pitcher, just use the second best
+        if best_idx is None:
+            best_idx = indices[0][1]
+            best_dist = distances[0][1]
         
         # 5. Extract the Winning MLB Clone from our Reference CSV
         clone_pitch = profiles_df.iloc[best_idx].copy()
@@ -152,7 +178,7 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
             "identity": {
                 "matched_pitcher_id": int(clone_pitcher_id),
                 "matched_pitch_type": matched_pitch_type,
-                "gmm_cluster_id": int(cluster_id), # <-- ADDED THIS FOR YOUR DATA
+                "gmm_cluster_id": int(cluster_id),
                 "coach_cue": f"This pitch moves and releases naturally like a {matched_pitch_type} from pitcher ID {int(clone_pitcher_id)}."
             },
             "arsenal": arsenal_data,
