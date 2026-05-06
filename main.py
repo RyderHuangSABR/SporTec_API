@@ -19,7 +19,6 @@ from engine.recommender import recommend_arsenal
 # ==========================================
 # 1. MODAL CLOUD CONFIGURATION
 # ==========================================
-# Build the container with all required libraries
 image = (
     modal.Image.debian_slim()
     .pip_install(
@@ -31,42 +30,35 @@ image = (
         "xgboost", 
         "scikit-learn", 
         "scipy", 
-        "huggingface_hub"
+        "huggingface_hub",
+        "joblib" # <--- FIX 2: ADDED JOBLIB HERE
     )
-    # This line is the magic fix. 
-    # It tells Modal: "Hey, take my local 'engine' folder and put it in the cloud server."
     .add_local_dir("engine", remote_path="/root/engine")
 )
 
 app_modal = modal.App("atlas-pitching-api")
 
-# Create a permanent cloud hard drive to protect your DuckDB database
 db_volume = modal.Volume.from_name("atlas-db-volume", create_if_missing=True)
 DB_PATH = "/data/atlas_application.db"
 
-# --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas_api")
 
-# --- LIFESPAN: INSTANT BOOT ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Starting up: Atlas API is active on Modal...")
     yield
 
-# --- APP INIT ---
 app = FastAPI(
     title="Atlas Pitching Analytics API",
     version="2.0.0",
     lifespan=lifespan 
 )
 
-# --- RATE LIMITING ---
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -76,10 +68,9 @@ app.add_middleware(
 )
 
 # ==========================================
-# 2. DATABASE INIT (MOVED TO CLOUD VOLUME)
+# 2. DATABASE INIT 
 # ==========================================
 def init_db():
-    # Connect to the indestructible Modal Volume path
     db = duckdb.connect(DB_PATH)
     db.execute("""
         CREATE TABLE IF NOT EXISTS api_clients (
@@ -102,11 +93,9 @@ def init_db():
     """)
     return db
 
-# --- SECURITY ---
 api_key_header = APIKeyHeader(name="X-API-Key")
 
 def authenticate_client(api_key: str = Security(api_key_header)):
-    # Pull Master Key dynamically from the environment
     MASTER_KEY = os.getenv("API_KEY", "6YHN4RFV3edc@")
     
     if api_key == MASTER_KEY:
@@ -126,6 +115,7 @@ def authenticate_client(api_key: str = Security(api_key_header)):
 
 # --- MODELS ---
 class TargetPitch(BaseModel):
+    MLBID: int | None = None # <--- FIX 1: ADDED THIS FOR THE SELF-MATCH FILTER
     pitch_type: str = "FF" 
     p_throws: str
     vaa: float
@@ -247,10 +237,9 @@ async def generate_api_key(req: APIKeyRequest):
     image=image, 
     secrets=[modal.Secret.from_name("my-huggingface-secret-2")], 
     volumes={"/data": db_volume},
-    min_containers=1 # Keeps at least 1 server ready instantly so it doesn't cold boot
+    min_containers=1
 )
 @modal.asgi_app()
 def fastapi_app():
-    # Initialize the database on the hard drive right before handing off to FastAPI
     init_db()
     return app
