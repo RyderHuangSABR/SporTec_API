@@ -116,7 +116,7 @@ def authenticate_client(api_key: str = Security(api_key_header)):
 # --- MODELS ---
 class TargetPitch(BaseModel):
     MLBID: int | None = None # <--- FIX 1: ADDED THIS FOR THE SELF-MATCH FILTER
-    pitch_type: str = "FF" 
+    pitch_type: str
     p_throws: str
     vaa: float
     haa: float
