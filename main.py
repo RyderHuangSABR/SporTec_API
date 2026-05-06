@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from huggingface_hub import HfApi, HfFileSystem # <--- NEW: Imported for the Data Lake connection
 
 import modal
 from engine.recommender import recommend_arsenal
@@ -31,7 +32,7 @@ image = (
         "scikit-learn", 
         "scipy", 
         "huggingface_hub",
-        "joblib" # <--- FIX 2: ADDED JOBLIB HERE
+        "joblib"
     )
     .add_local_dir("engine", remote_path="/root/engine")
 )
@@ -115,7 +116,7 @@ def authenticate_client(api_key: str = Security(api_key_header)):
 
 # --- MODELS ---
 class TargetPitch(BaseModel):
-    MLBID: int | None = None # <--- FIX 1: ADDED THIS FOR THE SELF-MATCH FILTER
+    MLBID: int | None = None 
     pitch_type: str
     p_throws: str
     vaa: float
@@ -131,6 +132,10 @@ class APIKeyRequest(BaseModel):
     client_name: str
     tier: str
     admin_password: str
+
+# <--- NEW: Strict request model for the Injury Risk endpoint
+class DriftRequest(BaseModel):
+    mlbid: int
 
 # --- TELEMETRY ---
 def log_application_telemetry(client_name: str, pitch_data: dict, recommendation: dict):
@@ -202,6 +207,73 @@ async def predict_pitch(
     except Exception as e:
         logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail="Prediction failed")
+
+# <--- NEW: The Decoupled Shadow Tracker Endpoint
+@app.post("/api/v1/injury-risk")
+@limiter.limit("10/minute") 
+async def check_injury_risk(
+    request: Request,
+    drift_req: DriftRequest,
+    client_name: str = Security(authenticate_client)
+):
+    logger.info(f"📡 Checking Data Lake for MLBID {drift_req.mlbid} alerts. Requested by: {client_name}")
+    
+    try:
+        hf_token = os.environ.get("HF_TOKEN")
+        repo_id = "RyderHuangSABR/Atlas_Pitching_Data"
+        
+        api = HfApi(token=hf_token)
+        fs = HfFileSystem(token=hf_token)
+
+        # 1. Look for the Alert files in Hugging Face
+        all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+        alert_files = [f for f in all_files if f.startswith("alerts/injury_warning_")]
+        
+        if not alert_files:
+             return {
+                "status": "success",
+                "mlbid": drift_req.mlbid,
+                "injury_warning": False,
+                "message": "No recent alert logs found in the database. Pitcher is clear."
+            }
+
+        # 2. Grab the most recently generated alert list
+        latest_alert_file = sorted(alert_files)[-1]
+        
+        # 3. Read the CSV directly into memory
+        with fs.open(f"hf://datasets/{repo_id}/{latest_alert_file}", "rb") as f:
+            alerts_df = pd.read_csv(f)
+            
+        # 4. Check if our pitcher's ID is on the bad list!
+        pitcher_alert = alerts_df[alerts_df['MLBID'] == drift_req.mlbid]
+        
+        if not pitcher_alert.empty:
+            # They are on the list! Extract their worst drifting pitch.
+            target = pitcher_alert.iloc[0]
+            return {
+                "status": "warning",
+                "mlbid": drift_req.mlbid,
+                "pitch_analyzed": target['pitch_type'],
+                "injury_warning": True,
+                "drift": {
+                    "extension_drift": round(target['Extension_Drift'], 2),
+                    "vaa_drift": round(target['VAA_Drift'], 2),
+                    "haa_drift": round(target['HAA_Drift'], 2)
+                },
+                "message": f"🚨 ALERT: Massive mechanical drift detected in scan: {latest_alert_file}"
+            }
+        else:
+            # They are NOT on the list. All good.
+            return {
+                "status": "success",
+                "mlbid": drift_req.mlbid,
+                "injury_warning": False,
+                "message": "Pitcher is not drifting significantly. Cleared by the latest Shadow Tracker scan."
+            }
+            
+    except Exception as e:
+        logger.error(f"Alert fetch error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch alerts from Data Lake: {str(e)}")
 
 @app.post("/admin/generate_key")
 async def generate_api_key(req: APIKeyRequest):
