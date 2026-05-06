@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from huggingface_hub import HfApi, HfFileSystem # <--- NEW: Imported for the Data Lake connection
+from huggingface_hub import HfApi, HfFileSystem 
 
 import modal
 from engine.recommender import recommend_arsenal
@@ -133,7 +133,6 @@ class APIKeyRequest(BaseModel):
     tier: str
     admin_password: str
 
-# <--- NEW: Strict request model for the Injury Risk endpoint
 class DriftRequest(BaseModel):
     mlbid: int
 
@@ -208,7 +207,7 @@ async def predict_pitch(
         logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail="Prediction failed")
 
-# <--- NEW: The Decoupled Shadow Tracker Endpoint
+
 @app.post("/api/v1/injury-risk")
 @limiter.limit("10/minute") 
 async def check_injury_risk(
@@ -225,7 +224,6 @@ async def check_injury_risk(
         api = HfApi(token=hf_token)
         fs = HfFileSystem(token=hf_token)
 
-        # 1. Look for the Alert files in Hugging Face
         all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
         alert_files = [f for f in all_files if f.startswith("alerts/injury_warning_")]
         
@@ -234,40 +232,41 @@ async def check_injury_risk(
                 "status": "success",
                 "mlbid": drift_req.mlbid,
                 "injury_warning": False,
+                "signal_level": "NORMAL",
                 "message": "No recent alert logs found in the database. Pitcher is clear."
             }
 
-        # 2. Grab the most recently generated alert list
         latest_alert_file = sorted(alert_files)[-1]
         
-        # 3. Read the CSV directly into memory
         with fs.open(f"hf://datasets/{repo_id}/{latest_alert_file}", "rb") as f:
             alerts_df = pd.read_csv(f)
             
-        # 4. Check if our pitcher's ID is on the bad list!
         pitcher_alert = alerts_df[alerts_df['MLBID'] == drift_req.mlbid]
         
         if not pitcher_alert.empty:
-            # They are on the list! Extract their worst drifting pitch.
             target = pitcher_alert.iloc[0]
+            # Safely grab the signal level, default to ALARM if older CSV formatting is caught
+            signal_level = str(target.get('Signal_Level', 'ALARM'))
+            
             return {
-                "status": "warning",
+                "status": "warning" if signal_level == "CAUTION" else "critical",
                 "mlbid": drift_req.mlbid,
                 "pitch_analyzed": target['pitch_type'],
                 "injury_warning": True,
+                "signal_level": signal_level,
                 "drift": {
                     "extension_drift": round(target['Extension_Drift'], 2),
                     "vaa_drift": round(target['VAA_Drift'], 2),
                     "haa_drift": round(target['HAA_Drift'], 2)
                 },
-                "message": f"🚨 ALERT: Massive mechanical drift detected in scan: {latest_alert_file}"
+                "message": f"🚨 {signal_level} TRIGGERED: Mechanical drift detected in scan: {latest_alert_file}"
             }
         else:
-            # They are NOT on the list. All good.
             return {
                 "status": "success",
                 "mlbid": drift_req.mlbid,
                 "injury_warning": False,
+                "signal_level": "NORMAL",
                 "message": "Pitcher is not drifting significantly. Cleared by the latest Shadow Tracker scan."
             }
             
