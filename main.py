@@ -237,7 +237,7 @@ async def generate_api_key(req: APIKeyRequest):
     image=image, 
     secrets=[modal.Secret.from_name("my-huggingface-secret-2")], 
     volumes={"/data": db_volume},
-    min_containers=1
+    min_containers=0
 )
 @modal.asgi_app()
 def fastapi_app():
