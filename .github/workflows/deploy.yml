@@ -17,13 +17,16 @@ jobs:
         with:
           python-version: "3.11" 
 
+      # ==========================================
+      # THE FIX: Added joblib & forced python -m pip
+      # ==========================================
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install modal duckdb pandas fastapi pydantic slowapi xgboost scikit-learn scipy huggingface_hub
+          python -m pip install modal duckdb pandas fastapi pydantic slowapi xgboost scikit-learn scipy huggingface_hub joblib
 
       - name: Deploy to Modal Cloud
-        run: modal deploy main.py::app_modal
+        run: modal deploy main.py
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
