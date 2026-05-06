@@ -82,7 +82,8 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
     try:
         # Load Reference Data and ML Models
         profiles_df = load_reference_profiles()
-        gmm_model = load_sk_model("gmm_baseline.joblib")
+        gmm_model = load_sk_model("gmm_baseline_2026.joblib")
+        scaler = load_sk_model("scaler_2026.joblib")
         knn_model = load_sk_model("knn_baseline.joblib")
         
         target_pitch_type = target_df['pitch_type'].iloc[0] if 'pitch_type' in target_df.columns else "FF"
