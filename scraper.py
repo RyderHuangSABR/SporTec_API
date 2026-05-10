@@ -5,90 +5,90 @@ import pandas as pd
 from datetime import datetime, timedelta
 from huggingface_hub import HfApi
 
-print("🕵️‍♂️ Booting the Atlas Automated Scraper...")
+print("🚀 Initiating Daily Statcast Fetch (T-Minus 1 Day)...")
 
-# ==========================================
-# 1. AUTHENTICATE THE VAULT
-# ==========================================
-HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
-    raise ValueError("❌ HF_TOKEN missing! The GitHub Action did not pass the secret.")
+# --- CONFIGURATION ---
+HF_TOKEN = os.environ.get("HF_TOKEN") # Uses your secure environment variable
+HF_REPO_ID = "RyderHuangSABR/Atlas_Pitching_Data" 
 
-DATA_REPO = "RyderHuangSABR/Atlas_Pitching_Data"
+COLUMNS_TO_KEEP = [
+    'game_date', 'game_type', 'pitcher', 'pitch_name', 'pitch_type', 
+    'release_speed', 'effective_speed', 'release_pos_x', 'release_pos_z', 
+    'release_extension', 'pfx_x', 'pfx_z', 'spin_axis', 'release_spin_rate', 
+    'plate_x', 'plate_z', 'vx0', 'vy0', 'vz0', 'ax', 'ay', 'az',
+    'description', 'events', 'type' ,'launch_speed','launch_angle',
+    'delta_run_exp','estimated_woba_using_speedangle'
+]
 
-# ==========================================
-# 2. THE MOZILLA-BYPASS ENGINE
-# ==========================================
-def scrape_savant_csv(start_date, end_date, is_milb=False):
-    level = "MiLB" if is_milb else "MLB"
-    print(f"📡 Requesting {level} Data for {start_date}...")
-
-    url = "https://baseballsavant.mlb.com/statcast_search/csv"
+def fetch_daily_data(target_date_str, is_milb=False):
+    league_flag = "&minors=true" if is_milb else ""
+    league_name = "MiLB" if is_milb else "MLB"
     
-    params = {
-        "all": "true", "hfGT": "R|", "player_type": "pitcher",
-        "game_date_gt": start_date, "game_date_lt": end_date,
-        "minors": "true" if is_milb else "false", 
-        "type": "details"
-    }
+    print(f"📡 Sweeping {league_name} for {target_date_str}...", end=" ")
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/csv"
-    }
+    # Using your original, battle-tested URL structure
+    url = f"https://baseballsavant.mlb.com/statcast_search/csv?all=true&hfGT=R%7C&player_type=pitcher&game_date_gt={target_date_str}&game_date_lt={target_date_str}&type=details{league_flag}"
     
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=60)
+        response = requests.get(url, timeout=30)
         
-        if response.status_code != 200:
-            print(f"⚠️ Warning: Savant returned status {response.status_code} for {level}.")
-            return pd.DataFrame()
+        if len(response.text) > 500: 
+            df = pd.read_csv(io.StringIO(response.text), low_memory=False)
             
-        df = pd.read_csv(io.StringIO(response.content.decode('utf-8')))
-        
-        if df.empty or 'pitch_type' not in df.columns:
-            return pd.DataFrame()
+            if not df.empty:
+                existing_cols = [c for c in COLUMNS_TO_KEEP if c in df.columns]
+                df = df[existing_cols]
+                
+                if 'pitcher' in df.columns:
+                    df = df.rename(columns={'pitcher': 'MLBID'})
+                
+                print(f"✅ Secured {len(df):,} pitches.")
+                return df
+            else:
+                print("⚠️ Empty data frame. (No games played)")
+        else:
+            print("💤 No Data Returned.")
             
-        df['league_level'] = level
-        return df
-
     except Exception as e:
-        print(f"❌ Error pulling {level}: {e}")
-        return pd.DataFrame()
+        print(f"❌ Server error: {e}")
+        
+    return pd.DataFrame()
 
 # ==========================================
-# 3. EXECUTE THE DAILY HEIST
+# THE DAILY ENGINE
 # ==========================================
+# 1. Target Yesterday exactly
 yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+daily_pitches = []
 
-mlb_df = scrape_savant_csv(yesterday, yesterday, is_milb=False)
-milb_df = scrape_savant_csv(yesterday, yesterday, is_milb=True)
+# 2. Grab MLB & MiLB
+mlb_df = fetch_daily_data(yesterday, is_milb=False)
+milb_df = fetch_daily_data(yesterday, is_milb=True)
 
-# Safely combine only the dataframes that actually have data
-frames = [df for df in [mlb_df, milb_df] if not df.empty]
+if not mlb_df.empty: daily_pitches.append(mlb_df)
+if not milb_df.empty: daily_pitches.append(milb_df)
 
-if not frames:
-    print("🌙 No valid pitches found for yesterday. Engine returning to standby mode.")
-    exit(0)
-
-combined_df = pd.concat(frames, ignore_index=True)
-print(f"✅ Successfully extracted {len(combined_df)} total pitches (MLB + MiLB).")
-
-# ==========================================
-# 4. COMPRESS AND UPLOAD
-# ==========================================
-file_name = f"Pitches_{yesterday}.parquet"
-combined_df.to_parquet(file_name, engine='pyarrow')
-
-print(f"📦 Compressing into Parquet format: {file_name}")
-
-# Pass the token DIRECTLY into the HfApi to avoid CI/CD cache permission crashes
-api = HfApi(token=HF_TOKEN)
-api.upload_file(
-    path_or_fileobj=file_name,
-    path_in_repo=f"daily_pulls/{file_name}", 
-    repo_id=DATA_REPO,
-    repo_type="dataset"
-)
-
-print("🚀 Payload delivered to Hugging Face Vault. The pipeline is complete.")
+# 3. STITCH AND UPLOAD
+if daily_pitches:
+    print("\n🧬 Stitching the Daily Vault together...")
+    daily_df = pd.concat(daily_pitches, ignore_index=True)
+    daily_df = daily_df.drop_duplicates()
+    
+    print(f"🎉 SUCCESS! Total Pitches Secured: {len(daily_df):,}")
+    
+    # Format the file name dynamically
+    file_name = f"Pitches_{yesterday}.parquet"
+    daily_df.to_parquet(file_name, index=False)
+    print(f"💾 Saved locally as: {file_name}")
+    
+    print("🚀 Beaming directly to Hugging Face 'daily_pulls' folder...")
+    api = HfApi(token=HF_TOKEN)
+    api.upload_file(
+        path_or_fileobj=file_name,
+        path_in_repo=f"daily_pulls/{file_name}", # Routs exactly to the subfolder
+        repo_id=HF_REPO_ID,
+        repo_type="dataset"
+    )
+    print("🏆 DAILY ARCHITECTURE COMPLETE.")
+else:
+    print(f"🌙 No data collected for {yesterday}. Standby mode.")
