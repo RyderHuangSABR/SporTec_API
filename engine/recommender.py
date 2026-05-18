@@ -7,6 +7,7 @@ import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from huggingface_hub import hf_hub_download
+from functools import lru_cache
 
 # Import constants from your features module
 from engine.features import FEATURES, PITCH_GROUPS
@@ -16,8 +17,9 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # 1. LOAD THE REFERENCE DATA (THE DICTIONARY)
 # ==========================================
+@lru_cache(maxsize=None)
 def load_reference_profiles() -> pd.DataFrame:
-    """Downloads the pitch profiles so KNN knows who the row numbers belong to."""
+    """Downloads the pitch profiles so KNN knows who the row numbers belong to. Cached for performance."""
     token = os.getenv("HF_TOKEN")
     try:
         csv_path = hf_hub_download(
@@ -34,8 +36,9 @@ def load_reference_profiles() -> pd.DataFrame:
 # ==========================================
 # 2. LOAD JOBLIB MODELS (GMM & SCALER)
 # ==========================================
+@lru_cache(maxsize=None)
 def load_sk_model(filename: str):
-    """Dynamically downloads and loads a scikit-learn .joblib model."""
+    """Dynamically downloads and loads a scikit-learn .joblib model. Cached for performance."""
     token = os.getenv("HF_TOKEN")
     try:
         logger.info(f"Pulling model: {filename}")
@@ -52,15 +55,15 @@ def load_sk_model(filename: str):
 # ==========================================
 # 3. LOAD XGBOOST WEIGHTS (THE ALPHA)
 # ==========================================
+@lru_cache(maxsize=None)
 def load_xgb_weights(pitch_group: str) -> np.ndarray:
     """
     Extracts the feature importance (gain) from the pre-trained XGBoost Whiff model.
-    These weights are used to penalize/reward the geometric distance in the KNN.
+    Cached for performance so it doesn't download on every single pitch match.
     """
     token = os.getenv("HF_TOKEN")
     
-    # 🛑 FIX: Explicitly targeting the Whiff model for stuff quality/strikeouts. 
-    # If you want pitch-to-contact comps instead, change this to Engine_B_Contact.
+    # Explicitly targeting the Whiff model for stuff quality/strikeouts. 
     filename = f"Engine_A_Whiff_{pitch_group}.json"
     
     try:
@@ -97,7 +100,7 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
     logger.info("Initializing ML pipeline matching...")
     
     try:
-        # 1. Load Reference Data and ML Models
+        # 1. Load Reference Data and ML Models (Now lightning fast due to @lru_cache)
         profiles_df = load_reference_profiles()
         gmm_model = load_sk_model("gmm_baseline_2026.joblib")
         scaler = load_sk_model("scaler_baseline_2026.joblib")
@@ -122,11 +125,11 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
         target_raw = target_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
         candidates_raw = profiles_df[FEATURES].apply(pd.to_numeric, errors='coerce').fillna(0)
         
-        # 3. Standardize Data (🛑 FIX: Removed scaler.fit() to protect baseline)
+        # 3. Standardize Data 
         target_scaled = scaler.transform(target_raw)
         candidates_scaled = scaler.transform(candidates_raw)
         
-        # 4. GMM Prediction (🛑 FIX: GMM receives UNWEIGHTED scaled data)
+        # 4. GMM Prediction 
         cluster_id = gmm_model.predict(target_scaled)[0]
         logger.info(f"GMM assigned this pitch to Cluster ID: {cluster_id}")
         
@@ -135,15 +138,15 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
         target_weighted = target_scaled * xgb_weights
         candidates_weighted = candidates_scaled * xgb_weights
         
-        # 6. Dynamic KNN (🛑 FIX: Symmetrically matching weighted target vs weighted candidates)
-        dynamic_knn = NearestNeighbors(n_neighbors=5)
+        # 6. Dynamic KNN (FIXED: Search pool expanded to 15 to escape self-matching clusters)
+        dynamic_knn = NearestNeighbors(n_neighbors=15)
         dynamic_knn.fit(candidates_weighted)
         distances, indices = dynamic_knn.kneighbors(target_weighted)
         
         best_idx = None
         best_dist = None
         
-        # Loop through the top 5 closest pitches
+        # Loop through the top 15 closest pitches
         for i in range(len(indices[0])):
             idx = indices[0][i]
             dist = distances[0][i]
@@ -159,10 +162,11 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
             best_dist = dist
             break
             
-        # Fallback: If somehow all 5 matches were the exact same pitcher
+        # Fallback: If somehow all 15 matches were the exact same pitcher
         if best_idx is None:
-            best_idx = indices[0][1]
-            best_dist = distances[0][1]
+            logger.warning(f"Pitcher {target_pitcher_id} consumed all 15 nearest neighbors. Defaulting to exact nearest.")
+            best_idx = indices[0][0]
+            best_dist = distances[0][0]
         
         # 7. Extract the Winning MLB Clone from our Reference CSV
         clone_pitch = profiles_df.iloc[best_idx].copy()
@@ -188,7 +192,9 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
         group_arsenal_data = sorted(group_arsenal_data, key=lambda x: x['usage'], reverse=True)
         
         # 9. Safety Net for Output
-        clean_clone = clone_pitch.replace({np.nan: None}).to_dict()
+        # Convert any numpy types to native Python types for clean JSON serialization later
+        clean_clone = {k: (None if pd.isna(v) else v.item() if isinstance(v, np.generic) else v) for k, v in clone_pitch.items()}
+        
         for col in target_df.columns:
             if col not in clean_clone:
                 clean_clone[col] = target_df[col].iloc[0]
