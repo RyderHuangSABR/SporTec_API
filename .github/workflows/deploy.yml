@@ -18,18 +18,32 @@ jobs:
           python-version: "3.11" 
 
       # ==========================================
-      # THE FIX: Added joblib & forced python -m pip
+      # 1. ADDED PYARMOR TO DEPENDENCIES
       # ==========================================
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install modal duckdb pandas fastapi pydantic slowapi xgboost scikit-learn scipy huggingface_hub joblib
+          python -m pip install pyarmor modal duckdb pandas fastapi pydantic slowapi xgboost scikit-learn scipy huggingface_hub joblib
 
       # ==========================================
-      # THE FIX: Explicitly target app_modal
+      # 2. NEW STEP: OBFUSCATE CODE & PREP FOLDER
+      # ==========================================
+      - name: Obfuscate Code with PyArmor
+        run: |
+          # Encrypt main.py and output it to the default dist/ folder
+          pyarmor gen main.py
+          
+          # Since your main.py uses .add_local_dir("engine"), 
+          # we must copy your engine folder into dist/ so Modal can find it!
+          cp -r engine dist/engine
+
+      # ==========================================
+      # 3. CHANGED DIRECTORY TO DIST/ BEFORE DEPLOYING
       # ==========================================
       - name: Deploy to Modal Cloud
-        run: modal deploy main.py::app_modal
+        run: |
+          cd dist
+          modal deploy main.py::app_modal
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
