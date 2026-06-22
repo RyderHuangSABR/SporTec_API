@@ -35,6 +35,7 @@ def score_pitch(df: pd.DataFrame, models: Dict[str, xgb.Booster], features: List
             X[col] = X[col].fillna(0.0)
             
     try:
+        # Note: enable_categorical=True requires pandas categorical types for non-numeric columns
         dmatrix = xgb.DMatrix(X, enable_categorical=True)
         
         # Model A: Whiff Engine | Model B: Contact Damage Engine
