@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import logging
 import joblib 
-import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from huggingface_hub import hf_hub_download
@@ -53,50 +52,22 @@ def load_sk_model(filename: str):
         raise
 
 # ==========================================
-# 3. LOAD XGBOOST WEIGHTS (THE ALPHA)
+# 3. FEATURE WEIGHTING (FALLBACK)
 # ==========================================
 @lru_cache(maxsize=None)
-def load_xgb_weights(pitch_group: str) -> np.ndarray:
+def get_equal_weights() -> np.ndarray:
     """
-    Extracts the feature importance (gain) from the pre-trained XGBoost Whiff model.
-    Cached for performance so it doesn't download on every single pitch match.
+    Returns an array of equal weights for all features.
+    Replaces the XGBoost feature importance weighting.
     """
-    token = os.getenv("HF_TOKEN")
-    
-    # Explicitly targeting the Whiff model for stuff quality/strikeouts. 
-    filename = f"Engine_A_Whiff_{pitch_group}.json"
-    
-    try:
-        logger.info(f"Pulling XGBoost model: {filename}")
-        model_path = hf_hub_download(
-            repo_id="RyderHuangSABR/Atlas_Pitching_ML", 
-            filename=filename, 
-            token=token
-        )
-        
-        # Load the Booster
-        bst = xgb.Booster()
-        bst.load_model(model_path)
-        
-        # Get feature importance based on 'gain'
-        importances = bst.get_score(importance_type='gain')
-        
-        # Map the importances to our specific feature array, defaulting to 0.01 if missing
-        weights = [importances.get(col, 0.01) for col in FEATURES]
-        weights_array = np.array(weights)
-        
-        # Normalize the weights so they sum to 1.0 to keep scaling stable
-        return weights_array / np.sum(weights_array)
-        
-    except Exception as e:
-        logger.warning(f"XGB Weighting Failed for {filename}. Defaulting to equal weights. Error: {e}")
-        return np.ones(len(FEATURES)) / len(FEATURES)
+    # Defaulting to equal weights that sum to 1.0 to keep scaling stable
+    return np.ones(len(FEATURES)) / len(FEATURES)
 
 # ==========================================
 # 4. MAIN RECOMMENDER 
 # ==========================================
 def recommend_arsenal(target_df: pd.DataFrame) -> dict:
-    """Matches pitch using serialized GMM and Weighted KNN models."""
+    """Matches pitch using serialized GMM and KNN models."""
     logger.info("Initializing ML pipeline matching...")
     
     try:
@@ -133,12 +104,12 @@ def recommend_arsenal(target_df: pd.DataFrame) -> dict:
         cluster_id = gmm_model.predict(target_scaled)[0]
         logger.info(f"GMM assigned this pitch to Cluster ID: {cluster_id}")
         
-        # 5. Extract XGBoost Alpha and apply to both Target and Candidates
-        xgb_weights = load_xgb_weights(target_pitch_group)
-        target_weighted = target_scaled * xgb_weights
-        candidates_weighted = candidates_scaled * xgb_weights
+        # 5. Apply Equal Weights (Replacing XGBoost Alpha)
+        weights = get_equal_weights()
+        target_weighted = target_scaled * weights
+        candidates_weighted = candidates_scaled * weights
         
-        # 6. Dynamic KNN (FIXED: Search pool expanded to 15 to escape self-matching clusters)
+        # 6. Dynamic KNN (Search pool expanded to 15 to escape self-matching clusters)
         dynamic_knn = NearestNeighbors(n_neighbors=15)
         dynamic_knn.fit(candidates_weighted)
         distances, indices = dynamic_knn.kneighbors(target_weighted)
