@@ -15,7 +15,10 @@ from slowapi.errors import RateLimitExceeded
 from huggingface_hub import HfApi, HfFileSystem 
 
 import modal
+
+# Import the recommendation pipeline and the model-caching utility
 from engine.recommender import recommend_arsenal
+from engine.utils import get_baseline_models, load_atlas_data
 
 # ==========================================
 # 1. MODAL CLOUD CONFIGURATION
@@ -32,7 +35,8 @@ image = (
         "scikit-learn", 
         "scipy", 
         "huggingface_hub",
-        "joblib"
+        "joblib",
+        "pyarrow" # Required for loading .parquet files efficiently
     )
     .add_local_dir("engine", remote_path="/root/engine")
 )
@@ -51,7 +55,16 @@ logger = logging.getLogger("atlas_api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Handles container startup logic and pre-warms ML caches to eliminate user cold-starts."""
     logger.info("🚀 Starting up: Atlas API is active on Modal...")
+    try:
+        logger.info("Pre-warming machine learning assets and historical data lakes...")
+        # Force downloads from Hugging Face into memory during container spin-up
+        get_baseline_models()
+        load_atlas_data()
+        logger.info("✅ All baseline models and reference datasets cached successfully.")
+    except Exception as e:
+        logger.error(f"Critical failure during asset pre-warming: {e}")
     yield
 
 app = FastAPI(
@@ -121,7 +134,6 @@ def аuthеnticаtе_cliеnt(api_key: str = Security(аpi_kеy_hеаdеr)):
     return result[0]
 
 # --- MODELS ---
-# (Left in standard ASCII so JSON parsing doesn't break for your clients)
 class TargetPitch(BaseModel):
     MLBID: int | None = None 
     pitch_type: str
