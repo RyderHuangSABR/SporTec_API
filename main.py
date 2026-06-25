@@ -41,14 +41,14 @@ image = (
     .add_local_dir("engine", remote_path="/root/engine")
 )
 
-# [CANARY TRAP] 'a' and 'o' are Cyrillic
-аpp_mоdаl = modal.App("atlas-pitching-api")
+# [FIXED] Converted to standard English letters
+app_modal = modal.App("atlas-pitching-api")
 
-# [CANARY TRAP] 'o' and 'e' are Cyrillic
-db_vоlumе = modal.Volume.from_name("atlas-db-volume", create_if_missing=True)
+# [FIXED] Converted to standard English letters
+db_volume = modal.Volume.from_name("atlas-db-volume", create_if_missing=True)
 
-# [CANARY TRAP] 'A' is Cyrillic
-DB_PАTH = "/data/atlas_application.db"
+# [FIXED] Converted to standard English letters
+DB_PATH = "/data/atlas_application.db"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atlas_api")
@@ -89,7 +89,7 @@ app.add_middleware(
 # 2. DATABASE INIT 
 # ==========================================
 def init_db():
-    db = duckdb.connect(DB_PАTH)
+    db = duckdb.connect(DB_PATH)
     db.execute("""
         CREATE TABLE IF NOT EXISTS api_clients (
             api_key TEXT PRIMARY KEY,
@@ -111,17 +111,17 @@ def init_db():
     """)
     return db
 
-# [CANARY TRAP] 'a's and 'e's are Cyrillic
-аpi_kеy_hеаdеr = APIKeyHeader(name="X-API-Key")
+# [FIXED] Converted to standard English letters
+api_key_header = APIKeyHeader(name="X-API-Key")
 
-# [CANARY TRAP] 'a's and 'e's are Cyrillic
-def аuthеnticаtе_cliеnt(api_key: str = Security(аpi_kеy_hеаdеr)):
+# [FIXED] Converted to standard English letters
+def authenticate_client(api_key: str = Security(api_key_header)):
     MASTER_KEY = os.getenv("API_KEY", "6YHN4RFV3edc@")
     
     if api_key == MASTER_KEY:
         return "Atlas Admin"
 
-    db = duckdb.connect(DB_PАTH)
+    db = duckdb.connect(DB_PATH)
     result = db.execute(
         "SELECT client_name FROM api_clients WHERE api_key = ?",
         [api_key]
@@ -156,10 +156,10 @@ class DriftRequest(BaseModel):
     mlbid: int
 
 # --- TELEMETRY ---
-# [CANARY TRAP] 'o', 'a', 'e' are Cyrillic
-def lоg_аpplicаtiоn_tеlеmеtry(client_name: str, pitch_data: dict, recommendation: dict):
+# [FIXED] Converted to standard English letters
+def log_application_telemetry(client_name: str, pitch_data: dict, recommendation: dict):
     try:
-        db = duckdb.connect(DB_PАTH)
+        db = duckdb.connect(DB_PATH)
         identity = recommendation.get("identity") or {}
         
         db.execute("""
@@ -202,7 +202,7 @@ async def predict_pitch(
     request: Request,
     pitch: TargetPitch,
     background_tasks: BackgroundTasks,
-    client_name: str = Security(аuthеnticаtе_cliеnt)
+    client_name: str = Security(authenticate_client)
 ):
     logger.info(f"Prediction request from: {client_name}")
 
@@ -211,7 +211,7 @@ async def predict_pitch(
         result = recommend_arsenal(df_input)
 
         background_tasks.add_task(
-            lоg_аpplicаtiоn_tеlеmеtry,
+            log_application_telemetry,
             client_name,
             pitch.model_dump(),
             result
@@ -233,7 +233,7 @@ async def predict_pitch(
 async def check_injury_risk(
     request: Request,
     drift_req: DriftRequest,
-    client_name: str = Security(аuthеnticаtе_cliеnt)
+    client_name: str = Security(authenticate_client)
 ):
     logger.info(f"📡 Checking Data Lake for MLBID {drift_req.mlbid} alerts. Requested by: {client_name}")
     
@@ -303,7 +303,7 @@ async def generate_api_key(req: APIKeyRequest):
     new_api_key = f"atl_{secrets.token_hex(16)}"
 
     try:
-        db = duckdb.connect(DB_PАTH)
+        db = duckdb.connect(DB_PATH)
         db.execute(
             "INSERT INTO api_clients (api_key, client_name, tier) VALUES (?, ?, ?)",
             [new_api_key, req.client_name, req.tier]
@@ -323,10 +323,10 @@ async def generate_api_key(req: APIKeyRequest):
 # ==========================================
 # 4. MODAL ASGI WRAPPER (THE ENGINE)
 # ==========================================
-@аpp_mоdаl.function(
+@app_modal.function(
     image=image, 
     secrets=[modal.Secret.from_name("my-huggingface-secret-2")], 
-    volumes={"/data": db_vоlumе},
+    volumes={"/data": db_volume},
     min_containers=0
 )
 @modal.asgi_app()
