@@ -18,8 +18,7 @@ import modal
 
 # Import the recommendation pipeline and the model-caching utility
 from engine.recommender import recommend_arsenal
-from engine.utils import get_baseline_models, load_atlas_data
-
+from engine.loader import get_baseline_models, load_atlas_data
 # ==========================================
 # 1. MODAL CLOUD CONFIGURATION
 # ==========================================
