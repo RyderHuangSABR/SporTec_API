@@ -32,8 +32,16 @@ def fetch_daily_data(target_date_str, is_milb=False):
     
     url = f"https://baseballsavant.mlb.com/statcast_search/csv?all=true&hfGT=R%7C&player_type=pitcher&game_date_gt={target_date_str}&game_date_lt={target_date_str}&type=details{league_flag}"
     
+    # ==========================================
+    # THE MOZILLA BYPASS (USER-AGENT DISGUISE)
+    # ==========================================
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
     try:
-        response = requests.get(url, timeout=30)
+        # Pass the headers into the request
+        response = requests.get(url, headers=headers, timeout=30)
         
         if len(response.text) > 500: 
             df = pd.read_csv(io.StringIO(response.text), low_memory=False)
